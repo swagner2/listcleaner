@@ -168,6 +168,9 @@ export function renderAccountList(accounts) {
       const btn = document.getElementById('addBtn');
       if (!id || !name || !key) { msg.textContent = 'All fields required'; msg.style.color = '#ff6b8a'; return; }
       btn.disabled = true;
+      btn.textContent = 'Validating API key...';
+      msg.textContent = 'Connecting to Klaviyo and counting profiles — this may take a moment...';
+      msg.style.color = '#7aaad4';
       try {
         const resp = await fetch('/api/accounts', {
           method: 'POST',
@@ -176,18 +179,21 @@ export function renderAccountList(accounts) {
         });
         const data = await resp.json();
         if (resp.ok) {
-          msg.textContent = 'Account added!';
+          const count = data.klaviyo_profile_count != null ? data.klaviyo_profile_count.toLocaleString() : '?';
+          msg.textContent = 'Account added! ' + count + ' profiles found in Klaviyo.';
           msg.style.color = '#00e5a0';
-          setTimeout(() => location.reload(), 1000);
+          setTimeout(() => location.reload(), 2000);
         } else {
           msg.textContent = data.error || 'Error adding account';
           msg.style.color = '#ff6b8a';
           btn.disabled = false;
+          btn.textContent = 'Add Account';
         }
       } catch (err) {
         msg.textContent = 'Error: ' + err.message;
         msg.style.color = '#ff6b8a';
         btn.disabled = false;
+        btn.textContent = 'Add Account';
       }
     }
   </script>

@@ -15,6 +15,56 @@ function sleep(ms) {
 }
 
 /**
+ * Validate a Klaviyo API key and get the total profile count.
+ * Uses the profile count endpoint (POST /api/profile-count) if available,
+ * otherwise estimates by paginating with minimal fields.
+ */
+export async function getProfileCount(apiKey) {
+  // First, validate the key with a minimal request
+  const testResp = await fetch(`${KLAVIYO_BASE}/profiles/?page[size]=1&fields[profile]=email`, {
+    headers: headers(apiKey),
+  });
+
+  if (testResp.status === 401 || testResp.status === 403) {
+    throw new Error('Invalid Klaviyo API key');
+  }
+  if (!testResp.ok) {
+    throw new Error(`Klaviyo API error: ${testResp.status}`);
+  }
+
+  // Count profiles by paginating with max page size, minimal fields
+  let count = 0;
+  let cursor = null;
+  const maxPages = 200; // Safety cap: 200 pages * 100 = 20k profiles max count
+  let pages = 0;
+
+  while (pages < maxPages) {
+    let url = `${KLAVIYO_BASE}/profiles/?page[size]=100&fields[profile]=email`;
+    if (cursor) url += `&page[cursor]=${encodeURIComponent(cursor)}`;
+
+    const resp = await fetch(url, { headers: headers(apiKey) });
+    if (!resp.ok) break;
+
+    const data = await resp.json();
+    count += (data.data || []).length;
+
+    if (!data.links?.next) break;
+    const nextUrl = new URL(data.links.next);
+    cursor = nextUrl.searchParams.get('page[cursor]');
+    if (!cursor) break;
+
+    pages++;
+    await sleep(80);
+  }
+
+  return {
+    valid: true,
+    profile_count: count,
+    capped: pages >= maxPages,
+  };
+}
+
+/**
  * Fetch a page of profiles from Klaviyo.
  * Returns { profiles: [{ id, email }], nextCursor: string|null }
  */

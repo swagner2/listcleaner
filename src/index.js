@@ -1,6 +1,6 @@
 import * as Sentry from '@sentry/cloudflare';
 import { getConfig, setConfig, getCursor, setCursor, getAccounts, getAccount, addAccount, removeAccount } from './config.js';
-import { fetchProfiles, fetchProfilesByList, suppressProfiles } from './klaviyo.js';
+import { fetchProfiles, fetchProfilesByList, suppressProfiles, getProfileCount } from './klaviyo.js';
 import { checkDomain } from './domain-checker.js';
 import { createVerifier } from './verification.js';
 import * as db from './db.js';
@@ -124,9 +124,19 @@ async function handleAddAccount(env, body) {
     return json({ error: 'Required: id, name, klaviyo_api_key' }, 400);
   }
   const id = body.id.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
+
+  // Validate the API key against Klaviyo and get profile count
+  let profileCount = 0;
+  try {
+    const result = await getProfileCount(body.klaviyo_api_key);
+    profileCount = result.profile_count;
+  } catch (err) {
+    return json({ error: `Klaviyo API key validation failed: ${err.message}` }, 400);
+  }
+
   try {
     await addAccount(env.CONFIG, { id, name: body.name, klaviyo_api_key: body.klaviyo_api_key });
-    return json({ created: true, id }, 201);
+    return json({ created: true, id, klaviyo_profile_count: profileCount }, 201);
   } catch (err) {
     Sentry.captureException(err);
     return json({ error: err.message }, 409);
