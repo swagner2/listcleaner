@@ -214,8 +214,10 @@ async function handleTrigger(env, ctx, accountId, mode) {
   await db.cleanupStuckRuns(env.DB);
 
   const labels = { sync: 'Sync started', spellcheck: 'Spell check started', verify: 'Verification started', full: 'Full scan started' };
+
+  // Run the single job step, then chain the next step via self-fetch
   ctx.waitUntil(
-    runJob(env, account, mode).catch(err => {
+    runJobStep(env, account, mode).catch(err => {
       console.error(`[${accountId}] ${mode} error:`, err);
       Sentry.captureException(err, { tags: { account_id: accountId, mode } });
     })
@@ -223,24 +225,59 @@ async function handleTrigger(env, ctx, accountId, mode) {
   return json({ triggered: true, account: accountId, mode, message: labels[mode] || labels.full }, 202);
 }
 
-// ============================================================
-// Job Router
-// ============================================================
-async function runJob(env, account, mode) {
-  if (mode === 'sync') return runSync(env, account);
-  if (mode === 'spellcheck') return runSpellCheck(env, account);
-  if (mode === 'verify') return runVerify(env, account);
-  // full = sync all profiles (looping), then spell check, then verify
-  let syncResult;
-  let totalSynced = 0;
-  do {
-    syncResult = await runSync(env, account);
-    totalSynced += syncResult.profiles_fetched;
-    console.log(`[${account.id}] FULL: synced ${totalSynced} so far, complete: ${syncResult.sync_complete}`);
-  } while (syncResult.sync_complete === false && syncResult.status !== 'failed');
+// Chain the next job step by calling our own trigger endpoint
+async function chainNext(env, accountId, nextMode) {
+  const workerUrl = env.WORKER_URL || 'https://klaviyo-list-cleaner.crmr.workers.dev';
+  const url = `${workerUrl}/accounts/${accountId}/api/trigger`;
+  console.log(`[${accountId}] Chaining next step: ${nextMode}`);
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': env.DASHBOARD_TOKEN ? `Bearer ${env.DASHBOARD_TOKEN}` : '',
+      },
+      body: JSON.stringify({ mode: nextMode }),
+    });
+  } catch (err) {
+    console.error(`[${accountId}] Chain fetch error:`, err.message);
+  }
+}
 
-  await runSpellCheck(env, account);
-  await runVerify(env, account);
+// ============================================================
+// Job Step Runner — runs ONE step, then chains the next
+// ============================================================
+async function runJobStep(env, account, mode) {
+  if (mode === 'sync') {
+    const result = await runSync(env, account);
+    // If sync isn't done, chain another sync
+    if (!result.sync_complete && result.status !== 'failed') {
+      await chainNext(env, account.id, 'sync');
+    }
+    return;
+  }
+
+  if (mode === 'spellcheck') {
+    await runSpellCheck(env, account);
+    return;
+  }
+
+  if (mode === 'verify') {
+    await runVerify(env, account);
+    return;
+  }
+
+  // full = sync (self-chaining), then spellcheck, then verify
+  // Start with sync; when sync is complete it chains to _full_spellcheck
+  const result = await runSync(env, account);
+  if (!result.sync_complete && result.status !== 'failed') {
+    // More profiles to sync — chain another full run (continues syncing)
+    await chainNext(env, account.id, 'full');
+  } else {
+    // Sync complete — run spell check + verify in this invocation (they're fast)
+    await runSpellCheck(env, account);
+    await runVerify(env, account);
+  }
 }
 
 // ============================================================
@@ -548,11 +585,12 @@ export default Sentry.withSentry(
       if (accounts.length === 0) { console.log('No accounts, skipping cron'); return; }
 
       for (const account of accounts) {
-        console.log(`[cron] Running jobs for: ${account.id}`);
+        console.log(`[cron] Triggering full scan for: ${account.id}`);
         try {
-          await runJob(env, account, 'full');
+          // Trigger via self-fetch so each account gets its own invocation chain
+          await chainNext(env, account.id, 'full');
         } catch (err) {
-          console.error(`[cron] Failed for ${account.id}:`, err.message);
+          console.error(`[cron] Failed to trigger ${account.id}:`, err.message);
           Sentry.captureException(err, { tags: { account_id: account.id, source: 'cron' } });
         }
       }

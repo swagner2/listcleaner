@@ -3,6 +3,9 @@ main = "src/index.js"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
 
+[vars]
+WORKER_URL = "https://klaviyo-list-cleaner.crmr.workers.dev"
+
 # Daily at 3 AM UTC
 [triggers]
 crons = ["0 3 * * *"]
