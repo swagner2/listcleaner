@@ -208,8 +208,11 @@ export function renderAccountList(accounts) {
 // --- Per-account dashboard ---
 export function renderDashboard(account, runs, statusSummary, config, totalProfiles) {
   const totalInvalid = statusSummary
-    .filter(s => s.status !== 'valid' && s.status !== 'pending')
+    .filter(s => ['invalid_domain', 'invalid_3p', 'disposable', 'spamtrap', 'abuse'].includes(s.status))
     .reduce((sum, s) => sum + s.count, 0);
+  const totalUnscanned = statusSummary.find(s => s.status === 'unscanned')?.count || 0;
+  const totalClean = statusSummary.find(s => s.status === 'clean')?.count || 0;
+  const totalValid = statusSummary.find(s => s.status === 'valid')?.count || 0;
 
   const lastRun = runs.length > 0 ? runs[0] : null;
 
@@ -229,7 +232,7 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
   <div id="statusBanner" style="display:none;background:#0d2a1e;border:1px solid #00e5a0;border-radius:8px;padding:16px 20px;margin-bottom:24px">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
       <div style="width:10px;height:10px;border-radius:50%;background:#00e5a0;animation:pulse 1.5s infinite"></div>
-      <strong style="color:#00e5a0">Run in progress</strong>
+      <strong style="color:#00e5a0" id="statusLabel">Run in progress</strong>
       <span id="statusRunId" style="color:#7aaad4;font-size:13px"></span>
     </div>
     <div style="display:flex;gap:24px;flex-wrap:wrap;font-size:13px;color:#7aaad4">
@@ -244,20 +247,24 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
 
   <div class="cards">
     <div class="card">
-      <div class="label">Total Profiles</div>
+      <div class="label">Synced Profiles</div>
       <div class="value">${totalProfiles.toLocaleString()}</div>
+    </div>
+    <div class="card">
+      <div class="label">Unscanned</div>
+      <div class="value yellow">${totalUnscanned.toLocaleString()}</div>
+    </div>
+    <div class="card">
+      <div class="label">Clean</div>
+      <div class="value green">${totalClean.toLocaleString()}</div>
+    </div>
+    <div class="card">
+      <div class="label">Verified Valid</div>
+      <div class="value green">${totalValid.toLocaleString()}</div>
     </div>
     <div class="card">
       <div class="label">Invalid Found</div>
       <div class="value red">${totalInvalid.toLocaleString()}</div>
-    </div>
-    <div class="card">
-      <div class="label">Last Run</div>
-      <div class="value" style="font-size:14px">${lastRun ? formatDate(lastRun.started_at) : 'Never'}</div>
-    </div>
-    <div class="card">
-      <div class="label">Last Run Status</div>
-      <div class="value ${lastRun?.status === 'completed' ? 'green' : lastRun?.status === 'failed' ? 'red' : 'yellow'}">${lastRun?.status || '—'}</div>
     </div>
   </div>
 
@@ -278,6 +285,7 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
     <thead>
       <tr>
         <th>Run</th>
+        <th>Job</th>
         <th>Started</th>
         <th>Fetched</th>
         <th>Domain Typos</th>
@@ -292,6 +300,7 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
       ${runs.map(r => `
         <tr>
           <td><a href="/accounts/${account.id}/api/runs/${r.id}">#${r.id}</a></td>
+          <td><span style="color:#7ec8f5;font-size:12px">${r.job_type || 'full'}</span></td>
           <td>${formatDate(r.started_at)}</td>
           <td>${r.profiles_fetched}</td>
           <td>${r.stage1_flagged}</td>
@@ -302,7 +311,7 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
           <td><span class="status-badge ${r.status}">${r.status}</span></td>
         </tr>
       `).join('')}
-      ${runs.length === 0 ? '<tr><td colspan="9" style="text-align:center;color:#7aaad4;padding:24px">No runs yet. Trigger one below or wait for the cron schedule.</td></tr>' : ''}
+      ${runs.length === 0 ? '<tr><td colspan="10" style="text-align:center;color:#7aaad4;padding:24px">No runs yet. Trigger one below or wait for the cron schedule.</td></tr>' : ''}
     </tbody>
   </table>
 
@@ -324,9 +333,12 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
     <span id="saveMsg" style="font-size:13px;color:#7aaad4"></span>
   </div>
 
-  <div style="margin-top:24px;display:flex;gap:12px;flex-wrap:wrap">
-    <button class="btn" onclick="triggerRun('full')" id="triggerBtn">Run Full Scan</button>
-    <button class="btn secondary" onclick="triggerRun('spellcheck')" id="spellcheckBtn">Spell Check Only</button>
+  <h2>Actions</h2>
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
+    <button class="btn" onclick="triggerRun('sync')" id="syncBtn">Sync Profiles</button>
+    <button class="btn" onclick="triggerRun('spellcheck')" id="spellcheckBtn" style="background:#7ec8f5">Spell Check</button>
+    <button class="btn secondary" onclick="triggerRun('verify')" id="verifyBtn">Verify (NeverBounce)</button>
+    <button class="btn secondary" onclick="triggerRun('full')" id="fullBtn">Full Scan</button>
     <a href="/domain-lists" class="btn secondary" style="text-decoration:none">Edit Domain Lists</a>
   </div>
 
@@ -376,8 +388,12 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
     }
 
     async function triggerRun(mode) {
-      const btn = mode === 'spellcheck' ? document.getElementById('spellcheckBtn') : document.getElementById('triggerBtn');
-      btn.disabled = true;
+      const btnMap = { sync: 'syncBtn', spellcheck: 'spellcheckBtn', verify: 'verifyBtn', full: 'fullBtn' };
+      const btn = document.getElementById(btnMap[mode] || 'fullBtn');
+      // Disable all action buttons
+      ['syncBtn','spellcheckBtn','verifyBtn','fullBtn'].forEach(id => {
+        const b = document.getElementById(id); if (b) b.disabled = true;
+      });
       btn.textContent = 'Starting...';
       try {
         const resp = await fetch('/accounts/${account.id}/api/trigger', {
@@ -386,7 +402,7 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
           body: JSON.stringify({ mode })
         });
         const data = await resp.json();
-        btn.textContent = mode === 'spellcheck' ? 'Spell check running...' : 'Running...';
+        btn.textContent = 'Running...';
         pollStatus();
       } catch (err) {
         btn.textContent = 'Error — try again';
@@ -405,6 +421,8 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
           const banner = document.getElementById('statusBanner');
           if (data.running) {
             banner.style.display = 'block';
+            const jobLabels = { sync: 'Syncing profiles', spellcheck: 'Running spell check', verify: 'Verifying emails', full: 'Full scan' };
+            document.getElementById('statusLabel').textContent = jobLabels[data.job_type] || 'Run in progress';
             document.getElementById('statusRunId').textContent = '#' + data.run_id;
             document.getElementById('statusFetched').textContent = data.profiles_fetched;
             document.getElementById('statusFlagged').textContent = data.stage1_flagged;
@@ -415,10 +433,11 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
             banner.style.display = 'none';
             clearInterval(pollInterval);
             pollInterval = null;
-            document.getElementById('triggerBtn').disabled = false;
-            document.getElementById('triggerBtn').textContent = 'Run Full Scan';
-            document.getElementById('spellcheckBtn').disabled = false;
-            document.getElementById('spellcheckBtn').textContent = 'Spell Check Only';
+            // Re-enable all buttons
+            const btns = { syncBtn: 'Sync Profiles', spellcheckBtn: 'Spell Check', verifyBtn: 'Verify (NeverBounce)', fullBtn: 'Full Scan' };
+            Object.entries(btns).forEach(([id, label]) => {
+              const b = document.getElementById(id); if (b) { b.disabled = false; b.textContent = label; }
+            });
             location.reload();
           }
         } catch (e) {}
@@ -437,6 +456,8 @@ function renderStatusBar(statusSummary, total) {
 
   const colors = {
     valid: '#00e5a0',
+    clean: '#4ecdc4',
+    unscanned: '#7aaad4',
     pending: '#7aaad4',
     invalid_domain: '#ff6b8a',
     invalid_3p: '#ff4466',
