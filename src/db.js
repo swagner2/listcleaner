@@ -1,9 +1,9 @@
 const now = () => new Date().toISOString();
 
-export async function createRun(db) {
+export async function createRun(db, accountId) {
   const result = await db.prepare(
-    'INSERT INTO runs (started_at, status) VALUES (?, ?)'
-  ).bind(now(), 'running').run();
+    'INSERT INTO runs (account_id, started_at, status) VALUES (?, ?, ?)'
+  ).bind(accountId, now(), 'running').run();
   return result.meta.last_row_id;
 }
 
@@ -32,12 +32,12 @@ export async function finishRun(db, runId, stats) {
   ).run();
 }
 
-export async function upsertProfile(db, profile) {
+export async function upsertProfile(db, accountId, profile) {
   const timestamp = now();
   await db.prepare(`
-    INSERT INTO profiles (klaviyo_id, email, domain, first_checked, last_checked, status, source, raw_result)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(klaviyo_id) DO UPDATE SET
+    INSERT INTO profiles (klaviyo_id, account_id, email, domain, first_checked, last_checked, status, source, raw_result)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(klaviyo_id, account_id) DO UPDATE SET
       email = excluded.email,
       last_checked = excluded.last_checked,
       status = excluded.status,
@@ -45,6 +45,7 @@ export async function upsertProfile(db, profile) {
       raw_result = excluded.raw_result
   `).bind(
     profile.klaviyo_id,
+    accountId,
     profile.email,
     profile.domain,
     timestamp,
@@ -55,14 +56,14 @@ export async function upsertProfile(db, profile) {
   ).run();
 }
 
-export async function getProfileByKlaviyoId(db, klaviyoId) {
+export async function getProfileByKlaviyoId(db, accountId, klaviyoId) {
   return await db.prepare(
-    'SELECT * FROM profiles WHERE klaviyo_id = ?'
-  ).bind(klaviyoId).first();
+    'SELECT * FROM profiles WHERE klaviyo_id = ? AND account_id = ?'
+  ).bind(klaviyoId, accountId).first();
 }
 
-export async function isProfileStale(db, klaviyoId, recheckDays) {
-  const profile = await getProfileByKlaviyoId(db, klaviyoId);
+export async function isProfileStale(db, accountId, klaviyoId, recheckDays) {
+  const profile = await getProfileByKlaviyoId(db, accountId, klaviyoId);
   if (!profile) return true;
 
   const lastChecked = new Date(profile.last_checked);
@@ -71,12 +72,13 @@ export async function isProfileStale(db, klaviyoId, recheckDays) {
   return lastChecked < cutoff;
 }
 
-export async function logAction(db, runId, action) {
+export async function logAction(db, runId, accountId, action) {
   await db.prepare(`
-    INSERT INTO actions (run_id, klaviyo_id, email, action, detail, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO actions (run_id, account_id, klaviyo_id, email, action, detail, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `).bind(
     runId,
+    accountId,
     action.klaviyo_id,
     action.email,
     action.action,
@@ -85,45 +87,52 @@ export async function logAction(db, runId, action) {
   ).run();
 }
 
-export async function getRunStats(db, limit = 20) {
+export async function getRunStats(db, accountId, limit = 20) {
   return await db.prepare(
-    'SELECT * FROM runs ORDER BY id DESC LIMIT ?'
-  ).bind(limit).all();
+    'SELECT * FROM runs WHERE account_id = ? ORDER BY id DESC LIMIT ?'
+  ).bind(accountId, limit).all();
 }
 
-export async function getRunDetail(db, runId) {
-  const run = await db.prepare('SELECT * FROM runs WHERE id = ?').bind(runId).first();
+export async function getRunDetail(db, accountId, runId) {
+  const run = await db.prepare(
+    'SELECT * FROM runs WHERE id = ? AND account_id = ?'
+  ).bind(runId, accountId).first();
   const actions = await db.prepare(
-    'SELECT * FROM actions WHERE run_id = ? ORDER BY id'
-  ).bind(runId).all();
+    'SELECT * FROM actions WHERE run_id = ? AND account_id = ? ORDER BY id'
+  ).bind(runId, accountId).all();
   return { run, actions: actions.results };
 }
 
-export async function getStatusSummary(db) {
+export async function getStatusSummary(db, accountId) {
   return await db.prepare(`
-    SELECT status, COUNT(*) as count FROM profiles GROUP BY status ORDER BY count DESC
-  `).all();
+    SELECT status, COUNT(*) as count FROM profiles WHERE account_id = ? GROUP BY status ORDER BY count DESC
+  `).bind(accountId).all();
 }
 
-export async function getProfiles(db, status, page = 1, pageSize = 50) {
+export async function getProfiles(db, accountId, status, page = 1, pageSize = 50) {
   const offset = (page - 1) * pageSize;
-  const query = status
-    ? 'SELECT * FROM profiles WHERE status = ? ORDER BY last_checked DESC LIMIT ? OFFSET ?'
-    : 'SELECT * FROM profiles ORDER BY last_checked DESC LIMIT ? OFFSET ?';
 
-  const params = status
-    ? [status, pageSize, offset]
-    : [pageSize, offset];
+  if (status) {
+    return await db.prepare(
+      'SELECT * FROM profiles WHERE account_id = ? AND status = ? ORDER BY last_checked DESC LIMIT ? OFFSET ?'
+    ).bind(accountId, status, pageSize, offset).all();
+  }
 
-  const stmt = db.prepare(query);
-  const bound = status
-    ? stmt.bind(status, pageSize, offset)
-    : stmt.bind(pageSize, offset);
-
-  return await bound.all();
+  return await db.prepare(
+    'SELECT * FROM profiles WHERE account_id = ? ORDER BY last_checked DESC LIMIT ? OFFSET ?'
+  ).bind(accountId, pageSize, offset).all();
 }
 
-export async function getTotalProfiles(db) {
-  const result = await db.prepare('SELECT COUNT(*) as total FROM profiles').first();
+export async function getTotalProfiles(db, accountId) {
+  const result = await db.prepare(
+    'SELECT COUNT(*) as total FROM profiles WHERE account_id = ?'
+  ).bind(accountId).first();
   return result.total;
+}
+
+// Get last run for an account (used in account list)
+export async function getLastRun(db, accountId) {
+  return await db.prepare(
+    'SELECT * FROM runs WHERE account_id = ? ORDER BY id DESC LIMIT 1'
+  ).bind(accountId).first();
 }

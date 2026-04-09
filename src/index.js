@@ -1,9 +1,9 @@
-import { getConfig, setConfig, getCursor, setCursor } from './config.js';
+import { getConfig, setConfig, getCursor, setCursor, getAccounts, getAccount, addAccount, removeAccount } from './config.js';
 import { fetchProfiles, fetchProfilesByList, suppressProfiles } from './klaviyo.js';
 import { checkDomain } from './domain-checker.js';
 import { createVerifier } from './verification.js';
 import * as db from './db.js';
-import { renderDashboard } from './dashboard.js';
+import { renderAccountList, renderDashboard } from './dashboard.js';
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -17,92 +17,181 @@ function checkAuth(request, env) {
   return token === env.DASHBOARD_TOKEN;
 }
 
+// --- Route parser ---
+function matchRoute(path) {
+  // /accounts/:id/api/runs/:runId
+  let m = path.match(/^\/accounts\/([^/]+)\/api\/runs\/(\d+)$/);
+  if (m) return { route: 'account_run_detail', accountId: m[1], runId: parseInt(m[2]) };
+
+  // /accounts/:id/api/*
+  m = path.match(/^\/accounts\/([^/]+)\/api\/(.+)$/);
+  if (m) return { route: `account_api_${m[2]}`, accountId: m[1] };
+
+  // /accounts/:id
+  m = path.match(/^\/accounts\/([^/]+)$/);
+  if (m) return { route: 'account_dashboard', accountId: m[1] };
+
+  // /api/accounts/:id
+  m = path.match(/^\/api\/accounts\/([^/]+)$/);
+  if (m) return { route: 'api_account_single', accountId: m[1] };
+
+  return { route: path };
+}
+
 // --- HTTP Handler ---
 async function handleFetch(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
+  const method = request.method;
 
-  // Auth check (skip for health endpoint)
-  if (path !== '/health' && !checkAuth(request, env)) {
-    return new Response('Unauthorized', { status: 401 });
-  }
-
-  // Route handling
-  if (path === '/' && request.method === 'GET') {
-    return handleDashboard(env);
-  }
+  // Health check — no auth
   if (path === '/health') {
     return new Response('OK', { status: 200 });
   }
-  if (path === '/api/stats' && request.method === 'GET') {
-    return handleStats(env);
+
+  // Auth check
+  if (!checkAuth(request, env)) {
+    return new Response('Unauthorized', { status: 401 });
   }
-  if (path.startsWith('/api/runs/') && request.method === 'GET') {
-    const runId = parseInt(path.split('/').pop());
-    return handleRunDetail(env, runId);
+
+  const { route, accountId, runId } = matchRoute(path);
+
+  // --- Root / account list ---
+  if (route === '/' && method === 'GET') {
+    return handleAccountListPage(env);
   }
-  if (path === '/api/profiles' && request.method === 'GET') {
+
+  // --- Account API (CRUD) ---
+  if (route === '/api/accounts' && method === 'GET') {
+    const accounts = await getAccounts(env.CONFIG);
+    return json(accounts.map(a => ({ id: a.id, name: a.name })));
+  }
+  if (route === '/api/accounts' && method === 'POST') {
+    const body = await request.json();
+    return handleAddAccount(env, body);
+  }
+  if (route === 'api_account_single' && method === 'DELETE') {
+    return handleRemoveAccount(env, accountId);
+  }
+
+  // --- Per-account routes ---
+  if (route === 'account_dashboard' && method === 'GET') {
+    return handleDashboard(env, accountId);
+  }
+  if (route === 'account_api_stats' && method === 'GET') {
+    return handleStats(env, accountId);
+  }
+  if (route === 'account_run_detail' && method === 'GET') {
+    return handleRunDetail(env, accountId, runId);
+  }
+  if (route === 'account_api_profiles' && method === 'GET') {
     const status = url.searchParams.get('status');
     const page = parseInt(url.searchParams.get('page') || '1');
-    return handleProfiles(env, status, page);
+    return handleProfiles(env, accountId, status, page);
   }
-  if (path === '/api/config' && request.method === 'GET') {
-    return handleGetConfig(env);
+  if (route === 'account_api_config' && method === 'GET') {
+    return handleGetConfig(env, accountId);
   }
-  if (path === '/api/config' && request.method === 'POST') {
+  if (route === 'account_api_config' && method === 'POST') {
     const body = await request.json();
-    return handleSetConfig(env, body);
+    return handleSetConfig(env, accountId, body);
   }
-  if (path === '/api/trigger' && request.method === 'POST') {
-    // Run pipeline in background, return immediately
-    const ctx = { waitUntil: (p) => p };
-    ctx.waitUntil(runPipeline(env));
-    return json({ triggered: true, message: 'Cleaning run started' }, 202);
+  if (route === 'account_api_trigger' && method === 'POST') {
+    return handleTrigger(env, accountId);
   }
 
   return new Response('Not Found', { status: 404 });
 }
 
-async function handleDashboard(env) {
-  const [runs, statusSummary, config, totalProfiles] = await Promise.all([
-    db.getRunStats(env.DB, 20),
-    db.getStatusSummary(env.DB),
-    getConfig(env.CONFIG),
-    db.getTotalProfiles(env.DB),
-  ]);
-  const html = renderDashboard(runs.results, statusSummary.results, config, totalProfiles);
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
-  });
+// --- Account list page ---
+async function handleAccountListPage(env) {
+  const accounts = await getAccounts(env.CONFIG);
+  const accountData = [];
+  for (const acct of accounts) {
+    const [totalProfiles, lastRun] = await Promise.all([
+      db.getTotalProfiles(env.DB, acct.id),
+      db.getLastRun(env.DB, acct.id),
+    ]);
+    accountData.push({ ...acct, totalProfiles, lastRun });
+  }
+  const html = renderAccountList(accountData);
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
-async function handleStats(env) {
+// --- Account CRUD ---
+async function handleAddAccount(env, body) {
+  if (!body.id || !body.name || !body.klaviyo_api_key) {
+    return json({ error: 'Required: id, name, klaviyo_api_key' }, 400);
+  }
+  // Sanitize id to slug
+  const id = body.id.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
+  try {
+    await addAccount(env.CONFIG, { id, name: body.name, klaviyo_api_key: body.klaviyo_api_key });
+    return json({ created: true, id }, 201);
+  } catch (err) {
+    return json({ error: err.message }, 409);
+  }
+}
+
+async function handleRemoveAccount(env, accountId) {
+  try {
+    await removeAccount(env.CONFIG, accountId);
+    return json({ deleted: true, id: accountId });
+  } catch (err) {
+    return json({ error: err.message }, 404);
+  }
+}
+
+// --- Per-account handlers ---
+async function handleDashboard(env, accountId) {
+  const account = await getAccount(env.CONFIG, accountId);
+  if (!account) return json({ error: 'Account not found' }, 404);
+
+  const [runs, statusSummary, config, totalProfiles] = await Promise.all([
+    db.getRunStats(env.DB, accountId, 20),
+    db.getStatusSummary(env.DB, accountId),
+    getConfig(env.CONFIG, accountId),
+    db.getTotalProfiles(env.DB, accountId),
+  ]);
+  const html = renderDashboard(account, runs.results, statusSummary.results, config, totalProfiles);
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+async function handleStats(env, accountId) {
   const [runs, statusSummary] = await Promise.all([
-    db.getRunStats(env.DB, 20),
-    db.getStatusSummary(env.DB),
+    db.getRunStats(env.DB, accountId, 20),
+    db.getStatusSummary(env.DB, accountId),
   ]);
   return json({ runs: runs.results, statusSummary: statusSummary.results });
 }
 
-async function handleRunDetail(env, runId) {
-  const detail = await db.getRunDetail(env.DB, runId);
+async function handleRunDetail(env, accountId, runId) {
+  const detail = await db.getRunDetail(env.DB, accountId, runId);
   if (!detail.run) return json({ error: 'Run not found' }, 404);
   return json(detail);
 }
 
-async function handleProfiles(env, status, page) {
-  const profiles = await db.getProfiles(env.DB, status, page);
+async function handleProfiles(env, accountId, status, page) {
+  const profiles = await db.getProfiles(env.DB, accountId, status, page);
   return json({ profiles: profiles.results, page });
 }
 
-async function handleGetConfig(env) {
-  const config = await getConfig(env.CONFIG);
+async function handleGetConfig(env, accountId) {
+  const config = await getConfig(env.CONFIG, accountId);
   return json(config);
 }
 
-async function handleSetConfig(env, updates) {
-  const config = await setConfig(env.CONFIG, updates);
+async function handleSetConfig(env, accountId, updates) {
+  const config = await setConfig(env.CONFIG, accountId, updates);
   return json(config);
+}
+
+async function handleTrigger(env, accountId) {
+  const account = await getAccount(env.CONFIG, accountId);
+  if (!account) return json({ error: 'Account not found' }, 404);
+  // Fire and forget
+  runPipeline(env, account).catch(err => console.error(`Trigger error for ${accountId}:`, err));
+  return json({ triggered: true, account: accountId, message: 'Cleaning run started' }, 202);
 }
 
 function json(data, status = 200) {
@@ -113,9 +202,10 @@ function json(data, status = 200) {
 }
 
 // --- Cleaning Pipeline ---
-async function runPipeline(env) {
-  const config = await getConfig(env.CONFIG);
-  const runId = await db.createRun(env.DB);
+async function runPipeline(env, account) {
+  const accountId = account.id;
+  const config = await getConfig(env.CONFIG, accountId);
+  const runId = await db.createRun(env.DB, accountId);
 
   const stats = {
     profiles_fetched: 0,
@@ -128,12 +218,12 @@ async function runPipeline(env) {
   };
 
   try {
-    const klaviyoKey = env.KLAVIYO_API_KEY;
-    if (!klaviyoKey) throw new Error('KLAVIYO_API_KEY not set');
+    const klaviyoKey = account.klaviyo_api_key;
+    if (!klaviyoKey) throw new Error(`No Klaviyo API key for account "${accountId}"`);
 
-    let cursor = await getCursor(env.CONFIG);
+    let cursor = await getCursor(env.CONFIG, accountId);
     let totalProcessed = 0;
-    const stage2Queue = []; // Emails that pass Stage 1, need 3rd-party check
+    const stage2Queue = [];
 
     // Fetch and process profiles page by page
     while (totalProcessed < config.max_profiles_per_run) {
@@ -149,32 +239,25 @@ async function runPipeline(env) {
 
       const { profiles, nextCursor } = result;
       if (profiles.length === 0) {
-        // Reached end of all profiles — reset cursor
-        await setCursor(env.CONFIG, null);
+        await setCursor(env.CONFIG, accountId, null);
         break;
       }
 
       stats.profiles_fetched += profiles.length;
       totalProcessed += profiles.length;
 
-      // Process each profile
       for (const profile of profiles) {
         try {
-          // Check if recently verified
-          const isStale = await db.isProfileStale(env.DB, profile.id, config.recheck_days);
+          const isStale = await db.isProfileStale(env.DB, accountId, profile.id, config.recheck_days);
           if (!isStale) continue;
 
           const domain = profile.email.split('@')[1] || '';
-
-          // Stage 1: Domain check
           const domainResult = checkDomain(profile.email);
 
           if (!domainResult.valid) {
-            const statusVal = domainResult.reason === 'disposable_domain'
-              ? 'disposable'
-              : 'invalid_domain';
+            const statusVal = domainResult.reason === 'disposable_domain' ? 'disposable' : 'invalid_domain';
 
-            await db.upsertProfile(env.DB, {
+            await db.upsertProfile(env.DB, accountId, {
               klaviyo_id: profile.id,
               email: profile.email,
               domain,
@@ -182,7 +265,7 @@ async function runPipeline(env) {
               source: 'domain_check',
             });
 
-            await db.logAction(env.DB, runId, {
+            await db.logAction(env.DB, runId, accountId, {
               klaviyo_id: profile.id,
               email: profile.email,
               action: 'flagged_domain',
@@ -191,11 +274,9 @@ async function runPipeline(env) {
 
             stats.stage1_flagged++;
           } else {
-            // Domain looks fine — queue for Stage 2 if enabled
             stage2Queue.push({ id: profile.id, email: profile.email, domain });
 
-            // Upsert as pending for now
-            await db.upsertProfile(env.DB, {
+            await db.upsertProfile(env.DB, accountId, {
               klaviyo_id: profile.id,
               email: profile.email,
               domain,
@@ -204,21 +285,15 @@ async function runPipeline(env) {
             });
           }
         } catch (err) {
-          console.error(`Error processing profile ${profile.id}:`, err.message);
+          console.error(`[${accountId}] Error processing profile ${profile.id}:`, err.message);
           stats.errors++;
         }
       }
 
-      // Save cursor for next page / next run
       cursor = nextCursor;
-      await setCursor(env.CONFIG, cursor);
+      await setCursor(env.CONFIG, accountId, cursor);
 
-      if (!nextCursor) {
-        // Reached end of all profiles
-        break;
-      }
-
-      // Small delay between Klaviyo pages
+      if (!nextCursor) break;
       await sleep(80);
     }
 
@@ -226,12 +301,11 @@ async function runPipeline(env) {
     if (config.stage2_enabled && stage2Queue.length > 0) {
       const verifierKey = env.NEVERBOUNCE_API_KEY;
       if (!verifierKey) {
-        console.warn('NEVERBOUNCE_API_KEY not set, skipping Stage 2');
+        console.warn(`[${accountId}] NEVERBOUNCE_API_KEY not set, skipping Stage 2`);
       } else {
         try {
           const verifier = createVerifier(config.stage2_provider, verifierKey);
 
-          // Process in batches
           for (let i = 0; i < stage2Queue.length; i += config.stage2_batch_size) {
             const batch = stage2Queue.slice(i, i + config.stage2_batch_size);
             const emails = batch.map(p => p.email);
@@ -243,7 +317,7 @@ async function runPipeline(env) {
               const vResult = results[j];
               const profile = batch[j];
 
-              await db.upsertProfile(env.DB, {
+              await db.upsertProfile(env.DB, accountId, {
                 klaviyo_id: profile.id,
                 email: profile.email,
                 domain: profile.domain,
@@ -254,8 +328,7 @@ async function runPipeline(env) {
 
               if (vResult.status !== 'valid' && vResult.status !== 'unknown') {
                 stats.stage2_invalid++;
-
-                await db.logAction(env.DB, runId, {
+                await db.logAction(env.DB, runId, accountId, {
                   klaviyo_id: profile.id,
                   email: profile.email,
                   action: 'flagged_3p',
@@ -265,7 +338,7 @@ async function runPipeline(env) {
             }
           }
         } catch (err) {
-          console.error('Stage 2 verification error:', err.message);
+          console.error(`[${accountId}] Stage 2 verification error:`, err.message);
           stats.errors++;
         }
       }
@@ -274,10 +347,9 @@ async function runPipeline(env) {
     // Auto-suppress if enabled
     if (config.auto_suppress) {
       const invalidStatuses = ['invalid_domain', 'invalid_3p', 'disposable', 'spamtrap', 'abuse'];
-      // Get all profiles flagged in this run that need suppression
       const toSuppress = [];
       for (const item of stage2Queue) {
-        const profile = await db.getProfileByKlaviyoId(env.DB, item.id);
+        const profile = await db.getProfileByKlaviyoId(env.DB, accountId, item.id);
         if (profile && invalidStatuses.includes(profile.status)) {
           toSuppress.push(profile.email);
         }
@@ -285,11 +357,10 @@ async function runPipeline(env) {
 
       if (toSuppress.length > 0) {
         try {
-          await suppressProfiles(klaviyoKey, toSuppress);
+          await suppressProfiles(account.klaviyo_api_key, toSuppress);
           stats.suppressed = toSuppress.length;
-
           for (const email of toSuppress) {
-            await db.logAction(env.DB, runId, {
+            await db.logAction(env.DB, runId, accountId, {
               klaviyo_id: '',
               email,
               action: 'suppressed',
@@ -297,15 +368,15 @@ async function runPipeline(env) {
             });
           }
         } catch (err) {
-          console.error('Suppression error:', err.message);
+          console.error(`[${accountId}] Suppression error:`, err.message);
           stats.errors++;
         }
       }
     }
 
-    console.log(`Run ${runId} complete:`, JSON.stringify(stats));
+    console.log(`[${accountId}] Run ${runId} complete:`, JSON.stringify(stats));
   } catch (err) {
-    console.error(`Pipeline error in run ${runId}:`, err.message);
+    console.error(`[${accountId}] Pipeline error in run ${runId}:`, err.message);
     stats.status = 'failed';
     stats.errors++;
   }
@@ -321,6 +392,20 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runPipeline(env));
+    const accounts = await getAccounts(env.CONFIG);
+    if (accounts.length === 0) {
+      console.log('No accounts configured, skipping scheduled run');
+      return;
+    }
+
+    // Run pipeline for each account sequentially
+    for (const account of accounts) {
+      console.log(`[cron] Starting pipeline for account: ${account.id}`);
+      try {
+        await runPipeline(env, account);
+      } catch (err) {
+        console.error(`[cron] Pipeline failed for ${account.id}:`, err.message);
+      }
+    }
   },
 };

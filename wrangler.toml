@@ -19,6 +19,6 @@ binding = "CONFIG"
 id = "2f15e0df8e2b453580f043505bb65a12"
 
 # Secrets (set via wrangler secret put):
-# KLAVIYO_API_KEY    - Klaviyo private API key (pk_xxx)
-# NEVERBOUNCE_API_KEY - NeverBounce API key
+# NEVERBOUNCE_API_KEY - NeverBounce API key (shared across accounts)
 # DASHBOARD_TOKEN    - Bearer token for dashboard access
+# Note: Klaviyo API keys are stored per-account in KV, not as secrets
