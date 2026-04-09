@@ -1,0 +1,24 @@
+name = "klaviyo-list-cleaner"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Daily at 3 AM UTC
+[triggers]
+crons = ["0 3 * * *"]
+
+# D1 database for profile state, run history, audit log
+[[d1_databases]]
+binding = "DB"
+database_name = "list-cleaner-db"
+database_id = "189c17fb-e906-4978-9089-1c06c2a75f8c"
+
+# KV namespace for configuration
+[[kv_namespaces]]
+binding = "CONFIG"
+id = "2f15e0df8e2b453580f043505bb65a12"
+
+# Secrets (set via wrangler secret put):
+# KLAVIYO_API_KEY    - Klaviyo private API key (pk_xxx)
+# NEVERBOUNCE_API_KEY - NeverBounce API key
+# DASHBOARD_TOKEN    - Bearer token for dashboard access
