@@ -1,3 +1,4 @@
+import * as Sentry from '@sentry/cloudflare';
 import { getConfig, setConfig, getCursor, setCursor, getAccounts, getAccount, addAccount, removeAccount } from './config.js';
 import { fetchProfiles, fetchProfilesByList, suppressProfiles } from './klaviyo.js';
 import { checkDomain } from './domain-checker.js';
@@ -19,19 +20,15 @@ function checkAuth(request, env) {
 
 // --- Route parser ---
 function matchRoute(path) {
-  // /accounts/:id/api/runs/:runId
   let m = path.match(/^\/accounts\/([^/]+)\/api\/runs\/(\d+)$/);
   if (m) return { route: 'account_run_detail', accountId: m[1], runId: parseInt(m[2]) };
 
-  // /accounts/:id/api/*
   m = path.match(/^\/accounts\/([^/]+)\/api\/(.+)$/);
   if (m) return { route: `account_api_${m[2]}`, accountId: m[1] };
 
-  // /accounts/:id
   m = path.match(/^\/accounts\/([^/]+)$/);
   if (m) return { route: 'account_dashboard', accountId: m[1] };
 
-  // /api/accounts/:id
   m = path.match(/^\/api\/accounts\/([^/]+)$/);
   if (m) return { route: 'api_account_single', accountId: m[1] };
 
@@ -44,24 +41,25 @@ async function handleFetch(request, env) {
   const path = url.pathname;
   const method = request.method;
 
-  // Health check — no auth
   if (path === '/health') {
     return new Response('OK', { status: 200 });
   }
 
-  // Auth check
   if (!checkAuth(request, env)) {
     return new Response('Unauthorized', { status: 401 });
   }
 
   const { route, accountId, runId } = matchRoute(path);
 
-  // --- Root / account list ---
+  // Set Sentry context for account-scoped routes
+  if (accountId) {
+    Sentry.setTag('account_id', accountId);
+  }
+
   if (route === '/' && method === 'GET') {
     return handleAccountListPage(env);
   }
 
-  // --- Account API (CRUD) ---
   if (route === '/api/accounts' && method === 'GET') {
     const accounts = await getAccounts(env.CONFIG);
     return json(accounts.map(a => ({ id: a.id, name: a.name })));
@@ -74,7 +72,6 @@ async function handleFetch(request, env) {
     return handleRemoveAccount(env, accountId);
   }
 
-  // --- Per-account routes ---
   if (route === 'account_dashboard' && method === 'GET') {
     return handleDashboard(env, accountId);
   }
@@ -123,12 +120,12 @@ async function handleAddAccount(env, body) {
   if (!body.id || !body.name || !body.klaviyo_api_key) {
     return json({ error: 'Required: id, name, klaviyo_api_key' }, 400);
   }
-  // Sanitize id to slug
   const id = body.id.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
   try {
     await addAccount(env.CONFIG, { id, name: body.name, klaviyo_api_key: body.klaviyo_api_key });
     return json({ created: true, id }, 201);
   } catch (err) {
+    Sentry.captureException(err);
     return json({ error: err.message }, 409);
   }
 }
@@ -189,8 +186,10 @@ async function handleSetConfig(env, accountId, updates) {
 async function handleTrigger(env, accountId) {
   const account = await getAccount(env.CONFIG, accountId);
   if (!account) return json({ error: 'Account not found' }, 404);
-  // Fire and forget
-  runPipeline(env, account).catch(err => console.error(`Trigger error for ${accountId}:`, err));
+  runPipeline(env, account).catch(err => {
+    console.error(`Trigger error for ${accountId}:`, err);
+    Sentry.captureException(err, { tags: { account_id: accountId } });
+  });
   return json({ triggered: true, account: accountId, message: 'Cleaning run started' }, 202);
 }
 
@@ -206,6 +205,9 @@ async function runPipeline(env, account) {
   const accountId = account.id;
   const config = await getConfig(env.CONFIG, accountId);
   const runId = await db.createRun(env.DB, accountId);
+
+  Sentry.setTag('account_id', accountId);
+  Sentry.setContext('run', { runId, accountId });
 
   const stats = {
     profiles_fetched: 0,
@@ -225,7 +227,6 @@ async function runPipeline(env, account) {
     let totalProcessed = 0;
     const stage2Queue = [];
 
-    // Fetch and process profiles page by page
     while (totalProcessed < config.max_profiles_per_run) {
       const remaining = config.max_profiles_per_run - totalProcessed;
       const pageSize = Math.min(config.batch_size, remaining);
@@ -258,41 +259,30 @@ async function runPipeline(env, account) {
             const statusVal = domainResult.reason === 'disposable_domain' ? 'disposable' : 'invalid_domain';
 
             await db.upsertProfile(env.DB, accountId, {
-              klaviyo_id: profile.id,
-              email: profile.email,
-              domain,
-              status: statusVal,
-              source: 'domain_check',
+              klaviyo_id: profile.id, email: profile.email, domain,
+              status: statusVal, source: 'domain_check',
             });
-
             await db.logAction(env.DB, runId, accountId, {
-              klaviyo_id: profile.id,
-              email: profile.email,
-              action: 'flagged_domain',
-              detail: domainResult.detail,
+              klaviyo_id: profile.id, email: profile.email,
+              action: 'flagged_domain', detail: domainResult.detail,
             });
-
             stats.stage1_flagged++;
           } else {
             stage2Queue.push({ id: profile.id, email: profile.email, domain });
-
             await db.upsertProfile(env.DB, accountId, {
-              klaviyo_id: profile.id,
-              email: profile.email,
-              domain,
-              status: 'pending',
-              source: null,
+              klaviyo_id: profile.id, email: profile.email, domain,
+              status: 'pending', source: null,
             });
           }
         } catch (err) {
           console.error(`[${accountId}] Error processing profile ${profile.id}:`, err.message);
+          Sentry.captureException(err, { tags: { account_id: accountId, profile_id: profile.id } });
           stats.errors++;
         }
       }
 
       cursor = nextCursor;
       await setCursor(env.CONFIG, accountId, cursor);
-
       if (!nextCursor) break;
       await sleep(80);
     }
@@ -310,7 +300,6 @@ async function runPipeline(env, account) {
             const batch = stage2Queue.slice(i, i + config.stage2_batch_size);
             const emails = batch.map(p => p.email);
             const results = await verifier.verifyBatch(emails);
-
             stats.stage2_sent += results.length;
 
             for (let j = 0; j < results.length; j++) {
@@ -318,27 +307,22 @@ async function runPipeline(env, account) {
               const profile = batch[j];
 
               await db.upsertProfile(env.DB, accountId, {
-                klaviyo_id: profile.id,
-                email: profile.email,
-                domain: profile.domain,
-                status: vResult.status,
-                source: `3p_${config.stage2_provider}`,
-                raw_result: vResult.raw,
+                klaviyo_id: profile.id, email: profile.email, domain: profile.domain,
+                status: vResult.status, source: `3p_${config.stage2_provider}`, raw_result: vResult.raw,
               });
 
               if (vResult.status !== 'valid' && vResult.status !== 'unknown') {
                 stats.stage2_invalid++;
                 await db.logAction(env.DB, runId, accountId, {
-                  klaviyo_id: profile.id,
-                  email: profile.email,
-                  action: 'flagged_3p',
-                  detail: `${config.stage2_provider}: ${vResult.status}`,
+                  klaviyo_id: profile.id, email: profile.email,
+                  action: 'flagged_3p', detail: `${config.stage2_provider}: ${vResult.status}`,
                 });
               }
             }
           }
         } catch (err) {
           console.error(`[${accountId}] Stage 2 verification error:`, err.message);
+          Sentry.captureException(err, { tags: { account_id: accountId, stage: 'stage2' } });
           stats.errors++;
         }
       }
@@ -361,14 +345,12 @@ async function runPipeline(env, account) {
           stats.suppressed = toSuppress.length;
           for (const email of toSuppress) {
             await db.logAction(env.DB, runId, accountId, {
-              klaviyo_id: '',
-              email,
-              action: 'suppressed',
-              detail: 'Auto-suppressed in Klaviyo',
+              klaviyo_id: '', email, action: 'suppressed', detail: 'Auto-suppressed in Klaviyo',
             });
           }
         } catch (err) {
           console.error(`[${accountId}] Suppression error:`, err.message);
+          Sentry.captureException(err, { tags: { account_id: accountId, stage: 'suppress' } });
           stats.errors++;
         }
       }
@@ -377,6 +359,7 @@ async function runPipeline(env, account) {
     console.log(`[${accountId}] Run ${runId} complete:`, JSON.stringify(stats));
   } catch (err) {
     console.error(`[${accountId}] Pipeline error in run ${runId}:`, err.message);
+    Sentry.captureException(err, { tags: { account_id: accountId, run_id: runId } });
     stats.status = 'failed';
     stats.errors++;
   }
@@ -385,27 +368,33 @@ async function runPipeline(env, account) {
   return stats;
 }
 
-// --- Export ---
-export default {
-  async fetch(request, env, ctx) {
-    return handleFetch(request, env);
-  },
+// --- Export with Sentry wrapping ---
+export default Sentry.withSentry(
+  (env) => ({
+    dsn: env.SENTRY_DSN || '',
+    tracesSampleRate: 0.1,
+  }),
+  {
+    async fetch(request, env, ctx) {
+      return handleFetch(request, env);
+    },
 
-  async scheduled(event, env, ctx) {
-    const accounts = await getAccounts(env.CONFIG);
-    if (accounts.length === 0) {
-      console.log('No accounts configured, skipping scheduled run');
-      return;
-    }
-
-    // Run pipeline for each account sequentially
-    for (const account of accounts) {
-      console.log(`[cron] Starting pipeline for account: ${account.id}`);
-      try {
-        await runPipeline(env, account);
-      } catch (err) {
-        console.error(`[cron] Pipeline failed for ${account.id}:`, err.message);
+    async scheduled(event, env, ctx) {
+      const accounts = await getAccounts(env.CONFIG);
+      if (accounts.length === 0) {
+        console.log('No accounts configured, skipping scheduled run');
+        return;
       }
-    }
-  },
-};
+
+      for (const account of accounts) {
+        console.log(`[cron] Starting pipeline for account: ${account.id}`);
+        try {
+          await runPipeline(env, account);
+        } catch (err) {
+          console.error(`[cron] Pipeline failed for ${account.id}:`, err.message);
+          Sentry.captureException(err, { tags: { account_id: account.id, source: 'cron' } });
+        }
+      }
+    },
+  }
+);

@@ -272,19 +272,68 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
 
   <h2>Configuration</h2>
   <div class="config-grid">
-    ${renderConfigItem('max_profiles_per_run', config.max_profiles_per_run)}
-    ${renderConfigItem('batch_size', config.batch_size)}
-    ${renderConfigItem('stage2_enabled', config.stage2_enabled)}
-    ${renderConfigItem('stage2_provider', config.stage2_provider)}
-    ${renderConfigItem('stage2_batch_size', config.stage2_batch_size)}
-    ${renderConfigItem('auto_suppress', config.auto_suppress)}
-    ${renderConfigItem('recheck_days', config.recheck_days)}
-    ${renderConfigItem('klaviyo_list_id', config.klaviyo_list_id || 'all profiles')}
+    ${renderConfigInput('max_profiles_per_run', config.max_profiles_per_run, 'number', 'Max profiles per run')}
+    ${renderConfigInput('batch_size', config.batch_size, 'number', 'Batch size (Klaviyo page size)')}
+    ${renderConfigToggle('stage2_enabled', config.stage2_enabled, 'NeverBounce verification')}
+    ${renderConfigInput('stage2_provider', config.stage2_provider, 'text', 'Verification provider')}
+    ${renderConfigInput('stage2_batch_size', config.stage2_batch_size, 'number', '3P batch size')}
+    ${renderConfigToggle('auto_suppress', config.auto_suppress, 'Auto-suppress invalid profiles')}
+    ${renderConfigInput('recheck_days', config.recheck_days, 'number', 'Recheck interval (days)')}
+    ${renderConfigInput('klaviyo_list_id', config.klaviyo_list_id || '', 'text', 'Klaviyo list ID (blank = all)')}
   </div>
 
-  <button class="btn" onclick="triggerRun()" id="triggerBtn">Run Now</button>
+  <div style="margin-top:16px;display:flex;gap:12px;align-items:center">
+    <button class="btn" onclick="saveConfig()" id="saveBtn">Save Configuration</button>
+    <span id="saveMsg" style="font-size:13px;color:#7aaad4"></span>
+  </div>
+
+  <div style="margin-top:24px">
+    <button class="btn secondary" onclick="triggerRun()" id="triggerBtn">Run Now</button>
+  </div>
 
   <script>
+    async function saveConfig() {
+      const btn = document.getElementById('saveBtn');
+      const msg = document.getElementById('saveMsg');
+      btn.disabled = true;
+      msg.textContent = 'Saving...';
+      msg.style.color = '#7aaad4';
+
+      const config = {};
+      document.querySelectorAll('[data-config-key]').forEach(el => {
+        const key = el.dataset.configKey;
+        const type = el.dataset.configType;
+        if (type === 'toggle') {
+          config[key] = el.checked;
+        } else if (type === 'number') {
+          config[key] = parseInt(el.value) || 0;
+        } else {
+          config[key] = el.value || null;
+        }
+      });
+
+      try {
+        const resp = await fetch('/accounts/${account.id}/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(config)
+        });
+        if (resp.ok) {
+          msg.textContent = 'Saved!';
+          msg.style.color = '#00e5a0';
+          setTimeout(() => { msg.textContent = ''; }, 2000);
+        } else {
+          const data = await resp.json();
+          msg.textContent = data.error || 'Error saving';
+          msg.style.color = '#ff6b8a';
+        }
+      } catch (err) {
+        msg.textContent = 'Error: ' + err.message;
+        msg.style.color = '#ff6b8a';
+      }
+      btn.disabled = false;
+    }
+
     async function triggerRun() {
       const btn = document.getElementById('triggerBtn');
       btn.disabled = true;
@@ -340,9 +389,36 @@ function renderStatusBar(statusSummary, total) {
   `;
 }
 
-function renderConfigItem(key, value) {
-  const display = typeof value === 'boolean' ? (value ? 'Yes' : 'No') : String(value);
-  return `<div class="config-item"><span class="config-key">${key}</span><span class="config-val">${display}</span></div>`;
+function renderConfigInput(key, value, type, label) {
+  return `<div class="config-item">
+    <div>
+      <span class="config-key">${key}</span>
+      <div style="font-size:11px;color:#556;margin-top:2px">${label}</div>
+    </div>
+    <input type="${type}" value="${escapeHtml(String(value))}"
+      data-config-key="${key}" data-config-type="${type}"
+      style="background:#0a1525;border:1px solid #1a2d4a;border-radius:4px;padding:6px 10px;color:#fff;font-size:14px;width:140px;text-align:right"
+    />
+  </div>`;
+}
+
+function renderConfigToggle(key, value, label) {
+  return `<div class="config-item">
+    <div>
+      <span class="config-key">${key}</span>
+      <div style="font-size:11px;color:#556;margin-top:2px">${label}</div>
+    </div>
+    <label style="position:relative;display:inline-block;width:48px;height:26px;cursor:pointer">
+      <input type="checkbox" ${value ? 'checked' : ''}
+        data-config-key="${key}" data-config-type="toggle"
+        style="opacity:0;width:0;height:0"
+      />
+      <span style="position:absolute;inset:0;background:${value ? '#00e5a0' : '#1a2d4a'};border-radius:13px;transition:0.2s"
+        onclick="this.style.background=this.previousElementSibling.checked?'#1a2d4a':'#00e5a0'"></span>
+      <span style="position:absolute;top:3px;left:${value ? '25px' : '3px'};width:20px;height:20px;background:#fff;border-radius:50%;transition:0.2s"
+        onclick="const c=this.parentElement.querySelector('input');c.checked=!c.checked;this.style.left=c.checked?'25px':'3px';this.previousElementSibling.style.background=c.checked?'#00e5a0':'#1a2d4a'"></span>
+    </label>
+  </div>`;
 }
 
 function formatDate(iso) {
