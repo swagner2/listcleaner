@@ -7,6 +7,7 @@ const DEFAULTS = {
   auto_suppress: false,
   recheck_days: 30,
   klaviyo_list_id: null,
+  notification_emails: [],
 };
 
 // --- Account management ---

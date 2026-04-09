@@ -86,6 +86,9 @@ async function handleFetch(request, env, ctx) {
     const page = parseInt(url.searchParams.get('page') || '1');
     return handleProfiles(env, accountId, status, page);
   }
+  if (route === 'account_api_status' && method === 'GET') {
+    return handleStatus(env, accountId);
+  }
   if (route === 'account_api_config' && method === 'GET') {
     return handleGetConfig(env, accountId);
   }
@@ -171,6 +174,23 @@ async function handleRunDetail(env, accountId, runId) {
 async function handleProfiles(env, accountId, status, page) {
   const profiles = await db.getProfiles(env.DB, accountId, status, page);
   return json({ profiles: profiles.results, page });
+}
+
+async function handleStatus(env, accountId) {
+  const activeRun = await db.getActiveRun(env.DB, accountId);
+  if (!activeRun) {
+    return json({ running: false });
+  }
+  return json({
+    running: true,
+    run_id: activeRun.id,
+    started_at: activeRun.started_at,
+    profiles_fetched: activeRun.profiles_fetched,
+    stage1_flagged: activeRun.stage1_flagged,
+    stage2_sent: activeRun.stage2_sent,
+    stage2_invalid: activeRun.stage2_invalid,
+    errors: activeRun.errors,
+  });
 }
 
 async function handleGetConfig(env, accountId) {
@@ -283,6 +303,9 @@ async function runPipeline(env, account) {
         }
       }
 
+      // Update progress in DB for live status
+      await db.updateRunProgress(env.DB, runId, stats);
+
       cursor = nextCursor;
       await setCursor(env.CONFIG, accountId, cursor);
       if (!nextCursor) break;
@@ -321,6 +344,8 @@ async function runPipeline(env, account) {
                 });
               }
             }
+            // Update progress after each 3P batch
+            await db.updateRunProgress(env.DB, runId, stats);
           }
         } catch (err) {
           console.error(`[${accountId}] Stage 2 verification error:`, err.message);
@@ -367,7 +392,55 @@ async function runPipeline(env, account) {
   }
 
   await db.finishRun(env.DB, runId, stats);
+
+  // Send email notification if configured
+  if (config.notification_emails && config.notification_emails.length > 0 && env.SENDGRID_API_KEY) {
+    try {
+      await sendRunNotification(env.SENDGRID_API_KEY, config.notification_emails, account, runId, stats);
+    } catch (err) {
+      console.error(`[${accountId}] Email notification error:`, err.message);
+    }
+  }
+
   return stats;
+}
+
+// --- Email notification ---
+async function sendRunNotification(apiKey, emails, account, runId, stats) {
+  const statusEmoji = stats.status === 'completed' ? 'Completed' : 'Failed';
+  const subject = `List Cleaner: ${account.name} run #${runId} — ${statusEmoji}`;
+
+  const body = `
+    <h2 style="font-family:sans-serif;color:#333">Run #${runId} — ${account.name}</h2>
+    <table style="font-family:sans-serif;border-collapse:collapse;font-size:14px">
+      <tr><td style="padding:4px 16px 4px 0;color:#666">Status</td><td style="font-weight:bold;color:${stats.status === 'completed' ? '#00a86b' : '#e53935'}">${stats.status}</td></tr>
+      <tr><td style="padding:4px 16px 4px 0;color:#666">Profiles Fetched</td><td>${stats.profiles_fetched}</td></tr>
+      <tr><td style="padding:4px 16px 4px 0;color:#666">Domain Typos Found</td><td>${stats.stage1_flagged}</td></tr>
+      <tr><td style="padding:4px 16px 4px 0;color:#666">Sent to NeverBounce</td><td>${stats.stage2_sent}</td></tr>
+      <tr><td style="padding:4px 16px 4px 0;color:#666">3P Invalid</td><td>${stats.stage2_invalid}</td></tr>
+      <tr><td style="padding:4px 16px 4px 0;color:#666">Suppressed</td><td>${stats.suppressed}</td></tr>
+      <tr><td style="padding:4px 16px 4px 0;color:#666">Errors</td><td style="color:${stats.errors > 0 ? '#e53935' : '#333'}">${stats.errors}</td></tr>
+    </table>
+    <p style="font-family:sans-serif;font-size:13px;color:#999;margin-top:16px">Sent by Klaviyo List Cleaner</p>
+  `.trim();
+
+  const resp = await fetch('https://api.sendgrid.com/v3/mail/send', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      personalizations: [{ to: emails.map(e => ({ email: e })) }],
+      from: { email: 'noreply@inboxsmarts.com', name: 'List Cleaner' },
+      subject,
+      content: [{ type: 'text/html', value: body }],
+    }),
+  });
+
+  if (!resp.ok) {
+    throw new Error(`SendGrid error: ${resp.status}`);
+  }
 }
 
 // --- Export with Sentry wrapping ---

@@ -37,4 +37,5 @@ head_sampling_rate = 1
 # NEVERBOUNCE_API_KEY - NeverBounce API key (shared across accounts)
 # DASHBOARD_TOKEN    - Bearer token for dashboard access
 # SENTRY_DSN         - Sentry DSN for error tracking (optional)
+# SENDGRID_API_KEY   - SendGrid API key for email notifications (optional)
 # Note: Klaviyo API keys are stored per-account in KV, not as secrets

@@ -216,6 +216,22 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
   <h1>${escapeHtml(account.name)}</h1>
   <p class="subtitle">Account: ${escapeHtml(account.id)} — ${totalProfiles} profiles tracked</p>
 
+  <div id="statusBanner" style="display:none;background:#0d2a1e;border:1px solid #00e5a0;border-radius:8px;padding:16px 20px;margin-bottom:24px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <div style="width:10px;height:10px;border-radius:50%;background:#00e5a0;animation:pulse 1.5s infinite"></div>
+      <strong style="color:#00e5a0">Run in progress</strong>
+      <span id="statusRunId" style="color:#7aaad4;font-size:13px"></span>
+    </div>
+    <div style="display:flex;gap:24px;flex-wrap:wrap;font-size:13px;color:#7aaad4">
+      <span>Fetched: <strong id="statusFetched" style="color:#fff">0</strong></span>
+      <span>Domain typos: <strong id="statusFlagged" style="color:#ff6b8a">0</strong></span>
+      <span>3P sent: <strong id="statusSent" style="color:#fff">0</strong></span>
+      <span>3P invalid: <strong id="statusInvalid" style="color:#ff6b8a">0</strong></span>
+      <span>Errors: <strong id="statusErrors" style="color:#fff">0</strong></span>
+    </div>
+  </div>
+  <style>@keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:0.3 } }</style>
+
   <div class="cards">
     <div class="card">
       <div class="label">Total Profiles</div>
@@ -280,6 +296,7 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
     ${renderConfigToggle('auto_suppress', config.auto_suppress, 'Auto-suppress invalid profiles')}
     ${renderConfigInput('recheck_days', config.recheck_days, 'number', 'Recheck interval (days)')}
     ${renderConfigInput('klaviyo_list_id', config.klaviyo_list_id || '', 'text', 'Klaviyo list ID (blank = all)')}
+    ${renderConfigInput('notification_emails', (config.notification_emails || []).join(', '), 'text', 'Notification emails (comma-separated)')}
   </div>
 
   <div style="margin-top:16px;display:flex;gap:12px;align-items:center">
@@ -305,6 +322,8 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
         const type = el.dataset.configType;
         if (type === 'toggle') {
           config[key] = el.checked;
+        } else if (key === 'notification_emails') {
+          config[key] = el.value ? el.value.split(',').map(e => e.trim()).filter(Boolean) : [];
         } else if (type === 'number') {
           config[key] = parseInt(el.value) || 0;
         } else {
@@ -341,13 +360,45 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
       try {
         const resp = await fetch('/accounts/${account.id}/api/trigger', { method: 'POST' });
         const data = await resp.json();
-        btn.textContent = 'Started! Refresh to see results.';
-        setTimeout(() => location.reload(), 5000);
+        btn.textContent = 'Running...';
+        pollStatus();
       } catch (err) {
         btn.textContent = 'Error — try again';
         btn.disabled = false;
       }
     }
+
+    // Poll for live run status
+    let pollInterval = null;
+    async function pollStatus() {
+      if (pollInterval) return;
+      pollInterval = setInterval(async () => {
+        try {
+          const resp = await fetch('/accounts/${account.id}/api/status');
+          const data = await resp.json();
+          const banner = document.getElementById('statusBanner');
+          if (data.running) {
+            banner.style.display = 'block';
+            document.getElementById('statusRunId').textContent = '#' + data.run_id;
+            document.getElementById('statusFetched').textContent = data.profiles_fetched;
+            document.getElementById('statusFlagged').textContent = data.stage1_flagged;
+            document.getElementById('statusSent').textContent = data.stage2_sent;
+            document.getElementById('statusInvalid').textContent = data.stage2_invalid;
+            document.getElementById('statusErrors').textContent = data.errors;
+          } else {
+            banner.style.display = 'none';
+            clearInterval(pollInterval);
+            pollInterval = null;
+            document.getElementById('triggerBtn').disabled = false;
+            document.getElementById('triggerBtn').textContent = 'Run Now';
+            location.reload();
+          }
+        } catch (e) {}
+      }, 3000);
+    }
+
+    // Check on page load if a run is active
+    pollStatus();
   </script>
 </body>
 </html>`;

@@ -136,3 +136,32 @@ export async function getLastRun(db, accountId) {
     'SELECT * FROM runs WHERE account_id = ? ORDER BY id DESC LIMIT 1'
   ).bind(accountId).first();
 }
+
+// Get active (running) run for an account
+export async function getActiveRun(db, accountId) {
+  return await db.prepare(
+    "SELECT * FROM runs WHERE account_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1"
+  ).bind(accountId).first();
+}
+
+// Update run stats mid-pipeline (for live progress)
+export async function updateRunProgress(db, runId, stats) {
+  await db.prepare(`
+    UPDATE runs SET
+      profiles_fetched = ?,
+      stage1_flagged = ?,
+      stage2_sent = ?,
+      stage2_invalid = ?,
+      suppressed = ?,
+      errors = ?
+    WHERE id = ?
+  `).bind(
+    stats.profiles_fetched,
+    stats.stage1_flagged,
+    stats.stage2_sent,
+    stats.stage2_invalid,
+    stats.suppressed,
+    stats.errors,
+    runId
+  ).run();
+}
