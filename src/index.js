@@ -36,7 +36,7 @@ function matchRoute(path) {
 }
 
 // --- HTTP Handler ---
-async function handleFetch(request, env) {
+async function handleFetch(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
@@ -94,7 +94,7 @@ async function handleFetch(request, env) {
     return handleSetConfig(env, accountId, body);
   }
   if (route === 'account_api_trigger' && method === 'POST') {
-    return handleTrigger(env, accountId);
+    return handleTrigger(env, ctx, accountId);
   }
 
   return new Response('Not Found', { status: 404 });
@@ -183,13 +183,15 @@ async function handleSetConfig(env, accountId, updates) {
   return json(config);
 }
 
-async function handleTrigger(env, accountId) {
+async function handleTrigger(env, ctx, accountId) {
   const account = await getAccount(env.CONFIG, accountId);
   if (!account) return json({ error: 'Account not found' }, 404);
-  runPipeline(env, account).catch(err => {
-    console.error(`Trigger error for ${accountId}:`, err);
-    Sentry.captureException(err, { tags: { account_id: accountId } });
-  });
+  ctx.waitUntil(
+    runPipeline(env, account).catch(err => {
+      console.error(`Trigger error for ${accountId}:`, err);
+      Sentry.captureException(err, { tags: { account_id: accountId } });
+    })
+  );
   return json({ triggered: true, account: accountId, message: 'Cleaning run started' }, 202);
 }
 
@@ -376,7 +378,7 @@ export default Sentry.withSentry(
   }),
   {
     async fetch(request, env, ctx) {
-      return handleFetch(request, env);
+      return handleFetch(request, env, ctx);
     },
 
     async scheduled(event, env, ctx) {
