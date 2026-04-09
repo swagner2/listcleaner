@@ -230,8 +230,15 @@ async function runJob(env, account, mode) {
   if (mode === 'sync') return runSync(env, account);
   if (mode === 'spellcheck') return runSpellCheck(env, account);
   if (mode === 'verify') return runVerify(env, account);
-  // full = all 3 in sequence
-  await runSync(env, account);
+  // full = sync all profiles (looping), then spell check, then verify
+  let syncResult;
+  let totalSynced = 0;
+  do {
+    syncResult = await runSync(env, account);
+    totalSynced += syncResult.profiles_fetched;
+    console.log(`[${account.id}] FULL: synced ${totalSynced} so far, complete: ${syncResult.sync_complete}`);
+  } while (syncResult.sync_complete === false && syncResult.status !== 'failed');
+
   await runSpellCheck(env, account);
   await runVerify(env, account);
 }
@@ -255,9 +262,10 @@ async function runSync(env, account) {
 
     let cursor = await getCursor(env.CONFIG, accountId);
     let pages = 0;
-    const maxPages = Math.ceil(config.max_profiles_per_run / 100);
+    // Hard cap: 15 pages (1500 profiles) per invocation to stay within Worker CPU limits
+    const MAX_PAGES_PER_RUN = 15;
 
-    while (pages < maxPages) {
+    while (pages < MAX_PAGES_PER_RUN) {
       let result;
       if (config.klaviyo_list_id) {
         result = await fetchProfilesByList(klaviyoKey, config.klaviyo_list_id, cursor, 100);
@@ -289,8 +297,9 @@ async function runSync(env, account) {
       await sleep(80);
     }
 
+    stats.sync_complete = !cursor;
     if (cursor) {
-      console.log(`[${accountId}] SYNC paused — cursor saved, will resume next run (${stats.profiles_fetched} synced this run)`);
+      console.log(`[${accountId}] SYNC paused at ${stats.profiles_fetched} profiles — cursor saved, more to sync`);
     }
   } catch (err) {
     console.error(`[${accountId}] SYNC error:`, err.message, err.stack);
@@ -541,10 +550,7 @@ export default Sentry.withSentry(
       for (const account of accounts) {
         console.log(`[cron] Running jobs for: ${account.id}`);
         try {
-          await runSync(env, account);
-          await runSpellCheck(env, account);
-          // Verify only if stage2 is enabled (checked inside runVerify)
-          await runVerify(env, account);
+          await runJob(env, account, 'full');
         } catch (err) {
           console.error(`[cron] Failed for ${account.id}:`, err.message);
           Sentry.captureException(err, { tags: { account_id: account.id, source: 'cron' } });
