@@ -1,7 +1,7 @@
 import * as Sentry from '@sentry/cloudflare';
 import { getConfig, setConfig, getCursor, setCursor, getAccounts, getAccount, addAccount, removeAccount } from './config.js';
 import { fetchProfiles, fetchProfilesByList, suppressProfiles, getProfileCount } from './klaviyo.js';
-import { checkDomain } from './domain-checker.js';
+import { checkDomain, getDomainCorrections, setDomainCorrections, getSafeDomains, setSafeDomains, getDisposableDomains, setDisposableDomains, initDomainLists } from './domain-checker.js';
 import { createVerifier } from './verification.js';
 import * as db from './db.js';
 import { renderAccountList, renderDashboard } from './dashboard.js';
@@ -72,6 +72,18 @@ async function handleFetch(request, env, ctx) {
     return handleRemoveAccount(env, accountId);
   }
 
+  // --- Domain list management (global, shared across accounts) ---
+  if (route === '/api/domain-lists' && method === 'GET') {
+    return handleGetDomainLists(env);
+  }
+  if (route === '/api/domain-lists' && method === 'POST') {
+    const body = await request.json();
+    return handleSetDomainLists(env, body);
+  }
+  if (route === '/domain-lists' && method === 'GET') {
+    return handleDomainListsPage(env);
+  }
+
   if (route === 'account_dashboard' && method === 'GET') {
     return handleDashboard(env, accountId);
   }
@@ -97,7 +109,9 @@ async function handleFetch(request, env, ctx) {
     return handleSetConfig(env, accountId, body);
   }
   if (route === 'account_api_trigger' && method === 'POST') {
-    return handleTrigger(env, ctx, accountId);
+    const body = await request.json().catch(() => ({}));
+    const mode = body.mode || 'full'; // 'full' or 'spellcheck'
+    return handleTrigger(env, ctx, accountId, mode);
   }
 
   return new Response('Not Found', { status: 404 });
@@ -203,6 +217,42 @@ async function handleStatus(env, accountId) {
   });
 }
 
+// --- Domain list handlers ---
+async function handleGetDomainLists(env) {
+  await initDomainLists(env.CONFIG);
+  const [corrections, safeDomains, disposableDomains] = await Promise.all([
+    getDomainCorrections(env.CONFIG),
+    getSafeDomains(env.CONFIG),
+    getDisposableDomains(env.CONFIG),
+  ]);
+  return json({ corrections, safe_domains: safeDomains, disposable_domains: disposableDomains });
+}
+
+async function handleSetDomainLists(env, body) {
+  if (body.corrections !== undefined) {
+    await setDomainCorrections(env.CONFIG, body.corrections);
+  }
+  if (body.safe_domains !== undefined) {
+    await setSafeDomains(env.CONFIG, body.safe_domains);
+  }
+  if (body.disposable_domains !== undefined) {
+    await setDisposableDomains(env.CONFIG, body.disposable_domains);
+  }
+  return json({ saved: true });
+}
+
+async function handleDomainListsPage(env) {
+  await initDomainLists(env.CONFIG);
+  const [corrections, safeDomains, disposableDomains] = await Promise.all([
+    getDomainCorrections(env.CONFIG),
+    getSafeDomains(env.CONFIG),
+    getDisposableDomains(env.CONFIG),
+  ]);
+  const { renderDomainListsPage } = await import('./dashboard.js');
+  const html = renderDomainListsPage(corrections, safeDomains, disposableDomains);
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
 async function handleGetConfig(env, accountId) {
   const config = await getConfig(env.CONFIG, accountId);
   return json(config);
@@ -213,16 +263,17 @@ async function handleSetConfig(env, accountId, updates) {
   return json(config);
 }
 
-async function handleTrigger(env, ctx, accountId) {
+async function handleTrigger(env, ctx, accountId, mode = 'full') {
   const account = await getAccount(env.CONFIG, accountId);
   if (!account) return json({ error: 'Account not found' }, 404);
   ctx.waitUntil(
-    runPipeline(env, account).catch(err => {
+    runPipeline(env, account, mode).catch(err => {
       console.error(`Trigger error for ${accountId}:`, err);
       Sentry.captureException(err, { tags: { account_id: accountId } });
     })
   );
-  return json({ triggered: true, account: accountId, message: 'Cleaning run started' }, 202);
+  const label = mode === 'spellcheck' ? 'Spell check only run started' : 'Full cleaning run started';
+  return json({ triggered: true, account: accountId, mode, message: label }, 202);
 }
 
 function json(data, status = 200) {
@@ -233,13 +284,22 @@ function json(data, status = 200) {
 }
 
 // --- Cleaning Pipeline ---
-async function runPipeline(env, account) {
+async function runPipeline(env, account, mode = 'full') {
   const accountId = account.id;
   const config = await getConfig(env.CONFIG, accountId);
   const runId = await db.createRun(env.DB, accountId);
+  const spellcheckOnly = mode === 'spellcheck';
 
   Sentry.setTag('account_id', accountId);
-  Sentry.setContext('run', { runId, accountId });
+  Sentry.setContext('run', { runId, accountId, mode });
+
+  // Load domain lists from KV
+  await initDomainLists(env.CONFIG);
+  const [corrections, safeDomains, disposableDomains] = await Promise.all([
+    getDomainCorrections(env.CONFIG),
+    getSafeDomains(env.CONFIG),
+    getDisposableDomains(env.CONFIG),
+  ]);
 
   const stats = {
     profiles_fetched: 0,
@@ -285,7 +345,7 @@ async function runPipeline(env, account) {
           if (!isStale) continue;
 
           const domain = profile.email.split('@')[1] || '';
-          const domainResult = checkDomain(profile.email);
+          const domainResult = checkDomain(profile.email, corrections, safeDomains, disposableDomains);
 
           if (!domainResult.valid) {
             const statusVal = domainResult.reason === 'disposable_domain' ? 'disposable' : 'invalid_domain';
@@ -322,8 +382,8 @@ async function runPipeline(env, account) {
       await sleep(80);
     }
 
-    // Stage 2: 3rd-party verification
-    if (config.stage2_enabled && stage2Queue.length > 0) {
+    // Stage 2: 3rd-party verification (skipped in spellcheck-only mode)
+    if (!spellcheckOnly && config.stage2_enabled && stage2Queue.length > 0) {
       const verifierKey = env.NEVERBOUNCE_API_KEY;
       if (!verifierKey) {
         console.warn(`[${accountId}] NEVERBOUNCE_API_KEY not set, skipping Stage 2`);
@@ -365,8 +425,8 @@ async function runPipeline(env, account) {
       }
     }
 
-    // Auto-suppress if enabled
-    if (config.auto_suppress) {
+    // Auto-suppress if enabled (skipped in spellcheck-only mode)
+    if (!spellcheckOnly && config.auto_suppress) {
       const invalidStatuses = ['invalid_domain', 'invalid_3p', 'disposable', 'spamtrap', 'abuse'];
       const toSuppress = [];
       for (const item of stage2Queue) {

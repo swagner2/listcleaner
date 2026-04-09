@@ -150,6 +150,10 @@ export function renderAccountList(accounts) {
   </div>
   ` : '<p style="color:#7aaad4;margin:16px 0">No accounts configured yet. Add one below.</p>'}
 
+  <div style="margin:24px 0">
+    <a href="/domain-lists" class="btn secondary" style="text-decoration:none">Edit Domain Lists</a>
+  </div>
+
   <h2>Add Account</h2>
   <div class="form-row">
     <input type="text" id="acctId" placeholder="Account ID (e.g., acme)" />
@@ -310,8 +314,10 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
     <span id="saveMsg" style="font-size:13px;color:#7aaad4"></span>
   </div>
 
-  <div style="margin-top:24px">
-    <button class="btn secondary" onclick="triggerRun()" id="triggerBtn">Run Now</button>
+  <div style="margin-top:24px;display:flex;gap:12px;flex-wrap:wrap">
+    <button class="btn" onclick="triggerRun('full')" id="triggerBtn">Run Full Scan</button>
+    <button class="btn secondary" onclick="triggerRun('spellcheck')" id="spellcheckBtn">Spell Check Only</button>
+    <a href="/domain-lists" class="btn secondary" style="text-decoration:none">Edit Domain Lists</a>
   </div>
 
   <script>
@@ -359,14 +365,18 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
       btn.disabled = false;
     }
 
-    async function triggerRun() {
-      const btn = document.getElementById('triggerBtn');
+    async function triggerRun(mode) {
+      const btn = mode === 'spellcheck' ? document.getElementById('spellcheckBtn') : document.getElementById('triggerBtn');
       btn.disabled = true;
       btn.textContent = 'Starting...';
       try {
-        const resp = await fetch('/accounts/${account.id}/api/trigger', { method: 'POST' });
+        const resp = await fetch('/accounts/${account.id}/api/trigger', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode })
+        });
         const data = await resp.json();
-        btn.textContent = 'Running...';
+        btn.textContent = mode === 'spellcheck' ? 'Spell check running...' : 'Running...';
         pollStatus();
       } catch (err) {
         btn.textContent = 'Error — try again';
@@ -396,7 +406,9 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
             clearInterval(pollInterval);
             pollInterval = null;
             document.getElementById('triggerBtn').disabled = false;
-            document.getElementById('triggerBtn').textContent = 'Run Now';
+            document.getElementById('triggerBtn').textContent = 'Run Full Scan';
+            document.getElementById('spellcheckBtn').disabled = false;
+            document.getElementById('spellcheckBtn').textContent = 'Spell Check Only';
             location.reload();
           }
         } catch (e) {}
@@ -487,4 +499,157 @@ function formatDate(iso) {
 
 function escapeHtml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// --- Domain lists editor page ---
+export function renderDomainListsPage(corrections, safeDomains, disposableDomains) {
+  // Group corrections by target domain for display
+  const grouped = {};
+  for (const [typo, correct] of Object.entries(corrections)) {
+    if (!grouped[correct]) grouped[correct] = [];
+    grouped[correct].push(typo);
+  }
+
+  const correctionRows = Object.entries(corrections)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([typo, correct]) => `${typo} → ${correct}`)
+    .join('\n');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Domain Lists — Klaviyo List Cleaner</title>
+  <style>${STYLES}
+    textarea {
+      width: 100%;
+      background: #0a1525;
+      border: 1px solid #1a2d4a;
+      border-radius: 6px;
+      padding: 12px;
+      color: #e0e8f0;
+      font-family: monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      resize: vertical;
+    }
+    textarea:focus { outline: none; border-color: #00e5a0; }
+    .section { margin-bottom: 32px; }
+    .section-desc { color: #7aaad4; font-size: 13px; margin-bottom: 8px; }
+    .count { color: #7aaad4; font-size: 12px; margin-top: 4px; }
+    .add-row { display: flex; gap: 8px; margin-top: 12px; }
+    .add-row input {
+      background: #0a1525; border: 1px solid #1a2d4a; border-radius: 4px;
+      padding: 8px 12px; color: #e0e8f0; font-size: 14px; flex: 1;
+    }
+    .add-row input:focus { outline: none; border-color: #00e5a0; }
+  </style>
+</head>
+<body>
+  <div class="breadcrumb"><a href="/">All Accounts</a> / Domain Lists</div>
+  <h1>Domain Lists</h1>
+  <p class="subtitle">Master lists shared across all accounts. Changes take effect on the next run.</p>
+
+  <div class="section">
+    <h2>Misspelled Domains</h2>
+    <p class="section-desc">One entry per line: <code>typo.com → correct.com</code>. These emails get flagged as invalid.</p>
+    <textarea id="corrections" rows="20">${escapeHtml(correctionRows)}</textarea>
+    <p class="count" id="corrCount">${Object.keys(corrections).length} entries</p>
+    <div class="add-row">
+      <input type="text" id="addTypo" placeholder="Misspelled domain (e.g., gmial.com)" />
+      <input type="text" id="addCorrect" placeholder="Correct domain (e.g., gmail.com)" />
+      <button class="btn" onclick="addCorrection()" style="margin:0;white-space:nowrap">Add</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Disposable Domains</h2>
+    <p class="section-desc">One domain per line. Emails from these domains are flagged as disposable.</p>
+    <textarea id="disposable" rows="10">${escapeHtml(disposableDomains.join('\n'))}</textarea>
+    <p class="count">${disposableDomains.length} entries</p>
+  </div>
+
+  <div class="section">
+    <h2>Safe Domains (Do Not Flag)</h2>
+    <p class="section-desc">One domain per line. These look like typos but are real providers (e.g., gmx.com).</p>
+    <textarea id="safe" rows="5">${escapeHtml(safeDomains.join('\n'))}</textarea>
+    <p class="count">${safeDomains.length} entries</p>
+  </div>
+
+  <div style="display:flex;gap:12px;align-items:center">
+    <button class="btn" onclick="saveLists()" id="saveBtn">Save All Lists</button>
+    <span id="saveMsg" style="font-size:13px;color:#7aaad4"></span>
+  </div>
+
+  <script>
+    function addCorrection() {
+      const typo = document.getElementById('addTypo').value.trim().toLowerCase();
+      const correct = document.getElementById('addCorrect').value.trim().toLowerCase();
+      if (!typo || !correct) return;
+      const textarea = document.getElementById('corrections');
+      textarea.value = textarea.value.trim() + '\\n' + typo + ' → ' + correct;
+      document.getElementById('addTypo').value = '';
+      document.getElementById('addCorrect').value = '';
+      updateCount();
+    }
+
+    function updateCount() {
+      const lines = document.getElementById('corrections').value.trim().split('\\n').filter(l => l.includes('→')).length;
+      document.getElementById('corrCount').textContent = lines + ' entries';
+    }
+
+    function parseCorrections(text) {
+      const result = {};
+      text.trim().split('\\n').forEach(line => {
+        line = line.trim();
+        if (!line || !line.includes('→')) return;
+        const [typo, correct] = line.split('→').map(s => s.trim().toLowerCase());
+        if (typo && correct) result[typo] = correct;
+      });
+      return result;
+    }
+
+    function parseList(text) {
+      return text.trim().split('\\n').map(l => l.trim().toLowerCase()).filter(Boolean);
+    }
+
+    async function saveLists() {
+      const btn = document.getElementById('saveBtn');
+      const msg = document.getElementById('saveMsg');
+      btn.disabled = true;
+      msg.textContent = 'Saving...';
+      msg.style.color = '#7aaad4';
+
+      const body = {
+        corrections: parseCorrections(document.getElementById('corrections').value),
+        disposable_domains: parseList(document.getElementById('disposable').value),
+        safe_domains: parseList(document.getElementById('safe').value),
+      };
+
+      try {
+        const resp = await fetch('/api/domain-lists', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (resp.ok) {
+          msg.textContent = 'Saved! Changes will apply on the next run.';
+          msg.style.color = '#00e5a0';
+          setTimeout(() => { msg.textContent = ''; }, 3000);
+        } else {
+          msg.textContent = 'Error saving';
+          msg.style.color = '#ff6b8a';
+        }
+      } catch (err) {
+        msg.textContent = 'Error: ' + err.message;
+        msg.style.color = '#ff6b8a';
+      }
+      btn.disabled = false;
+    }
+
+    document.getElementById('corrections').addEventListener('input', updateCount);
+  </script>
+</body>
+</html>`;
 }
