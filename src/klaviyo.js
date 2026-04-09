@@ -35,10 +35,8 @@ export async function getProfileCount(apiKey) {
   // Count profiles by paginating with max page size, minimal fields
   let count = 0;
   let cursor = null;
-  const maxPages = 200; // Safety cap: 200 pages * 100 = 20k profiles max count
-  let pages = 0;
 
-  while (pages < maxPages) {
+  while (true) {
     let url = `${KLAVIYO_BASE}/profiles/?page[size]=100&fields[profile]=email`;
     if (cursor) url += `&page[cursor]=${encodeURIComponent(cursor)}`;
 
@@ -53,14 +51,12 @@ export async function getProfileCount(apiKey) {
     cursor = nextUrl.searchParams.get('page[cursor]');
     if (!cursor) break;
 
-    pages++;
     await sleep(80);
   }
 
   return {
     valid: true,
     profile_count: count,
-    capped: pages >= maxPages,
   };
 }
 
