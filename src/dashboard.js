@@ -263,6 +263,16 @@ export function renderDashboard(account, runs, statusSummary, config, totalProfi
 
   ${renderStatusBar(statusSummary, totalProfiles)}
 
+  ${totalInvalid > 0 ? `
+  <h2>Export</h2>
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
+    <a href="/accounts/${account.id}/api/profiles?status=invalid_domain&format=csv" class="btn secondary" style="text-decoration:none;font-size:13px">Download Domain Typos (CSV)</a>
+    <a href="/accounts/${account.id}/api/profiles?status=invalid_3p&format=csv" class="btn secondary" style="text-decoration:none;font-size:13px">Download 3P Invalid (CSV)</a>
+    <a href="/accounts/${account.id}/api/profiles?status=disposable&format=csv" class="btn secondary" style="text-decoration:none;font-size:13px">Download Disposable (CSV)</a>
+    <a href="/accounts/${account.id}/api/profiles?format=csv" class="btn secondary" style="text-decoration:none;font-size:13px">Download All Profiles (CSV)</a>
+  </div>
+  ` : ''}
+
   <h2>Run History</h2>
   <table>
     <thead>

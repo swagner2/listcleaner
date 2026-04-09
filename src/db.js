@@ -137,6 +137,15 @@ export async function getLastRun(db, accountId) {
   ).bind(accountId).first();
 }
 
+// Clean up runs stuck in "running" for more than 10 minutes
+export async function cleanupStuckRuns(db) {
+  const cutoff = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  await db.prepare(`
+    UPDATE runs SET status = 'failed', finished_at = ?, errors = errors + 1
+    WHERE status = 'running' AND started_at < ?
+  `).bind(new Date().toISOString(), cutoff).run();
+}
+
 // Get active (running) run for an account
 export async function getActiveRun(db, accountId) {
   return await db.prepare(

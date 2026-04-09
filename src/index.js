@@ -51,7 +51,6 @@ async function handleFetch(request, env, ctx) {
 
   const { route, accountId, runId } = matchRoute(path);
 
-  // Set Sentry context for account-scoped routes
   if (accountId) {
     Sentry.setTag('account_id', accountId);
   }
@@ -72,7 +71,7 @@ async function handleFetch(request, env, ctx) {
     return handleRemoveAccount(env, accountId);
   }
 
-  // --- Domain list management (global, shared across accounts) ---
+  // --- Domain list management ---
   if (route === '/api/domain-lists' && method === 'GET') {
     return handleGetDomainLists(env);
   }
@@ -84,6 +83,7 @@ async function handleFetch(request, env, ctx) {
     return handleDomainListsPage(env);
   }
 
+  // --- Per-account routes ---
   if (route === 'account_dashboard' && method === 'GET') {
     return handleDashboard(env, accountId);
   }
@@ -96,7 +96,8 @@ async function handleFetch(request, env, ctx) {
   if (route === 'account_api_profiles' && method === 'GET') {
     const status = url.searchParams.get('status');
     const page = parseInt(url.searchParams.get('page') || '1');
-    return handleProfiles(env, accountId, status, page);
+    const format = url.searchParams.get('format');
+    return handleProfiles(env, accountId, status, page, format);
   }
   if (route === 'account_api_status' && method === 'GET') {
     return handleStatus(env, accountId);
@@ -110,7 +111,7 @@ async function handleFetch(request, env, ctx) {
   }
   if (route === 'account_api_trigger' && method === 'POST') {
     const body = await request.json().catch(() => ({}));
-    const mode = body.mode || 'full'; // 'full' or 'spellcheck'
+    const mode = body.mode || 'full';
     return handleTrigger(env, ctx, accountId, mode);
   }
 
@@ -119,6 +120,9 @@ async function handleFetch(request, env, ctx) {
 
 // --- Account list page ---
 async function handleAccountListPage(env) {
+  // Clean up any stuck "running" runs older than 10 minutes
+  await db.cleanupStuckRuns(env.DB);
+
   const accounts = await getAccounts(env.CONFIG);
   const accountData = [];
   for (const acct of accounts) {
@@ -139,7 +143,6 @@ async function handleAddAccount(env, body) {
   }
   const id = body.id.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
 
-  // Validate the API key against Klaviyo and get profile count
   let profileCount = 0;
   try {
     const result = await getProfileCount(body.klaviyo_api_key);
@@ -164,57 +167,6 @@ async function handleRemoveAccount(env, accountId) {
   } catch (err) {
     return json({ error: err.message }, 404);
   }
-}
-
-// --- Per-account handlers ---
-async function handleDashboard(env, accountId) {
-  const account = await getAccount(env.CONFIG, accountId);
-  if (!account) return json({ error: 'Account not found' }, 404);
-
-  const [runs, statusSummary, config, totalProfiles] = await Promise.all([
-    db.getRunStats(env.DB, accountId, 20),
-    db.getStatusSummary(env.DB, accountId),
-    getConfig(env.CONFIG, accountId),
-    db.getTotalProfiles(env.DB, accountId),
-  ]);
-  const html = renderDashboard(account, runs.results, statusSummary.results, config, totalProfiles);
-  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-}
-
-async function handleStats(env, accountId) {
-  const [runs, statusSummary] = await Promise.all([
-    db.getRunStats(env.DB, accountId, 20),
-    db.getStatusSummary(env.DB, accountId),
-  ]);
-  return json({ runs: runs.results, statusSummary: statusSummary.results });
-}
-
-async function handleRunDetail(env, accountId, runId) {
-  const detail = await db.getRunDetail(env.DB, accountId, runId);
-  if (!detail.run) return json({ error: 'Run not found' }, 404);
-  return json(detail);
-}
-
-async function handleProfiles(env, accountId, status, page) {
-  const profiles = await db.getProfiles(env.DB, accountId, status, page);
-  return json({ profiles: profiles.results, page });
-}
-
-async function handleStatus(env, accountId) {
-  const activeRun = await db.getActiveRun(env.DB, accountId);
-  if (!activeRun) {
-    return json({ running: false });
-  }
-  return json({
-    running: true,
-    run_id: activeRun.id,
-    started_at: activeRun.started_at,
-    profiles_fetched: activeRun.profiles_fetched,
-    stage1_flagged: activeRun.stage1_flagged,
-    stage2_sent: activeRun.stage2_sent,
-    stage2_invalid: activeRun.stage2_invalid,
-    errors: activeRun.errors,
-  });
 }
 
 // --- Domain list handlers ---
@@ -253,6 +205,91 @@ async function handleDomainListsPage(env) {
   return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
+// --- Per-account handlers ---
+async function handleDashboard(env, accountId) {
+  const account = await getAccount(env.CONFIG, accountId);
+  if (!account) return json({ error: 'Account not found' }, 404);
+
+  // Clean up stuck runs
+  await db.cleanupStuckRuns(env.DB);
+
+  const [runs, statusSummary, config, totalProfiles] = await Promise.all([
+    db.getRunStats(env.DB, accountId, 20),
+    db.getStatusSummary(env.DB, accountId),
+    getConfig(env.CONFIG, accountId),
+    db.getTotalProfiles(env.DB, accountId),
+  ]);
+  const html = renderDashboard(account, runs.results, statusSummary.results, config, totalProfiles);
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+async function handleStats(env, accountId) {
+  const [runs, statusSummary] = await Promise.all([
+    db.getRunStats(env.DB, accountId, 20),
+    db.getStatusSummary(env.DB, accountId),
+  ]);
+  return json({ runs: runs.results, statusSummary: statusSummary.results });
+}
+
+async function handleRunDetail(env, accountId, runId) {
+  const detail = await db.getRunDetail(env.DB, accountId, runId);
+  if (!detail.run) return json({ error: 'Run not found' }, 404);
+  return json(detail);
+}
+
+async function handleProfiles(env, accountId, status, page, format) {
+  const profiles = await db.getProfiles(env.DB, accountId, status, page, format === 'csv' ? 10000 : 50);
+
+  if (format === 'csv') {
+    const rows = [['email', 'domain', 'status', 'source', 'last_checked']];
+    for (const p of profiles.results) {
+      rows.push([p.email, p.domain, p.status, p.source || '', p.last_checked]);
+    }
+    const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+    const filename = status ? `profiles-${accountId}-${status}.csv` : `profiles-${accountId}-all.csv`;
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+      },
+    });
+  }
+
+  return json({ profiles: profiles.results, page });
+}
+
+async function handleStatus(env, accountId) {
+  const activeRun = await db.getActiveRun(env.DB, accountId);
+  if (!activeRun) {
+    return json({ running: false });
+  }
+  // Auto-fail runs stuck longer than 10 minutes
+  const startedAt = new Date(activeRun.started_at);
+  const minutesAgo = (Date.now() - startedAt.getTime()) / 60000;
+  if (minutesAgo > 10) {
+    await db.finishRun(env.DB, activeRun.id, {
+      profiles_fetched: activeRun.profiles_fetched,
+      stage1_flagged: activeRun.stage1_flagged,
+      stage2_sent: activeRun.stage2_sent,
+      stage2_invalid: activeRun.stage2_invalid,
+      suppressed: activeRun.suppressed,
+      errors: activeRun.errors + 1,
+      status: 'failed',
+    });
+    return json({ running: false });
+  }
+  return json({
+    running: true,
+    run_id: activeRun.id,
+    started_at: activeRun.started_at,
+    profiles_fetched: activeRun.profiles_fetched,
+    stage1_flagged: activeRun.stage1_flagged,
+    stage2_sent: activeRun.stage2_sent,
+    stage2_invalid: activeRun.stage2_invalid,
+    errors: activeRun.errors,
+  });
+}
+
 async function handleGetConfig(env, accountId) {
   const config = await getConfig(env.CONFIG, accountId);
   return json(config);
@@ -266,6 +303,10 @@ async function handleSetConfig(env, accountId, updates) {
 async function handleTrigger(env, ctx, accountId, mode = 'full') {
   const account = await getAccount(env.CONFIG, accountId);
   if (!account) return json({ error: 'Account not found' }, 404);
+
+  // Clean up any stuck runs before starting
+  await db.cleanupStuckRuns(env.DB);
+
   ctx.waitUntil(
     runPipeline(env, account, mode).catch(err => {
       console.error(`Trigger error for ${accountId}:`, err);
@@ -289,6 +330,8 @@ async function runPipeline(env, account, mode = 'full') {
   const config = await getConfig(env.CONFIG, accountId);
   const runId = await db.createRun(env.DB, accountId);
   const spellcheckOnly = mode === 'spellcheck';
+
+  console.log(`[${accountId}] Run ${runId} started (mode: ${mode})`);
 
   Sentry.setTag('account_id', accountId);
   Sentry.setContext('run', { runId, accountId, mode });
@@ -319,6 +362,8 @@ async function runPipeline(env, account, mode = 'full') {
     let totalProcessed = 0;
     const stage2Queue = [];
 
+    console.log(`[${accountId}] Starting fetch from cursor: ${cursor ? 'resuming' : 'beginning'}`);
+
     while (totalProcessed < config.max_profiles_per_run) {
       const remaining = config.max_profiles_per_run - totalProcessed;
       const pageSize = Math.min(config.batch_size, remaining);
@@ -332,6 +377,7 @@ async function runPipeline(env, account, mode = 'full') {
 
       const { profiles, nextCursor } = result;
       if (profiles.length === 0) {
+        console.log(`[${accountId}] No more profiles, resetting cursor`);
         await setCursor(env.CONFIG, accountId, null);
         break;
       }
@@ -339,11 +385,18 @@ async function runPipeline(env, account, mode = 'full') {
       stats.profiles_fetched += profiles.length;
       totalProcessed += profiles.length;
 
+      let pageChecked = 0;
+      let pageSkipped = 0;
+
       for (const profile of profiles) {
         try {
           const isStale = await db.isProfileStale(env.DB, accountId, profile.id, config.recheck_days);
-          if (!isStale) continue;
+          if (!isStale) {
+            pageSkipped++;
+            continue;
+          }
 
+          pageChecked++;
           const domain = profile.email.split('@')[1] || '';
           const domainResult = checkDomain(profile.email, corrections, safeDomains, disposableDomains);
 
@@ -360,10 +413,12 @@ async function runPipeline(env, account, mode = 'full') {
             });
             stats.stage1_flagged++;
           } else {
+            // Mark as valid (not pending) — domain passed Stage 1
+            const profileStatus = spellcheckOnly ? 'valid' : 'pending';
             stage2Queue.push({ id: profile.id, email: profile.email, domain });
             await db.upsertProfile(env.DB, accountId, {
               klaviyo_id: profile.id, email: profile.email, domain,
-              status: 'pending', source: null,
+              status: profileStatus, source: spellcheckOnly ? 'domain_check' : null,
             });
           }
         } catch (err) {
@@ -373,6 +428,8 @@ async function runPipeline(env, account, mode = 'full') {
         }
       }
 
+      console.log(`[${accountId}] Page: ${profiles.length} fetched, ${pageChecked} checked, ${pageSkipped} skipped, ${stats.stage1_flagged} flagged total`);
+
       // Update progress in DB for live status
       await db.updateRunProgress(env.DB, runId, stats);
 
@@ -381,6 +438,8 @@ async function runPipeline(env, account, mode = 'full') {
       if (!nextCursor) break;
       await sleep(80);
     }
+
+    console.log(`[${accountId}] Fetch complete: ${stats.profiles_fetched} fetched, ${stats.stage1_flagged} domain typos`);
 
     // Stage 2: 3rd-party verification (skipped in spellcheck-only mode)
     if (!spellcheckOnly && config.stage2_enabled && stage2Queue.length > 0) {
@@ -455,7 +514,7 @@ async function runPipeline(env, account, mode = 'full') {
 
     console.log(`[${accountId}] Run ${runId} complete:`, JSON.stringify(stats));
   } catch (err) {
-    console.error(`[${accountId}] Pipeline error in run ${runId}:`, err.message);
+    console.error(`[${accountId}] Pipeline error in run ${runId}:`, err.message, err.stack);
     Sentry.captureException(err, { tags: { account_id: accountId, run_id: runId } });
     stats.status = 'failed';
     stats.errors++;
@@ -477,8 +536,7 @@ async function runPipeline(env, account, mode = 'full') {
 
 // --- Email notification ---
 async function sendRunNotification(apiKey, emails, account, runId, stats) {
-  const statusEmoji = stats.status === 'completed' ? 'Completed' : 'Failed';
-  const subject = `List Cleaner: ${account.name} run #${runId} — ${statusEmoji}`;
+  const subject = `List Cleaner: ${account.name} run #${runId} — ${stats.status === 'completed' ? 'Completed' : 'Failed'}`;
 
   const body = `
     <h2 style="font-family:sans-serif;color:#333">Run #${runId} — ${account.name}</h2>
@@ -494,12 +552,9 @@ async function sendRunNotification(apiKey, emails, account, runId, stats) {
     <p style="font-family:sans-serif;font-size:13px;color:#999;margin-top:16px">Sent by Klaviyo List Cleaner</p>
   `.trim();
 
-  const resp = await fetch('https://api.sendgrid.com/v3/mail/send', {
+  await fetch('https://api.sendgrid.com/v3/mail/send', {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       personalizations: [{ to: emails.map(e => ({ email: e })) }],
       from: { email: 'noreply@inboxsmarts.com', name: 'List Cleaner' },
@@ -507,10 +562,6 @@ async function sendRunNotification(apiKey, emails, account, runId, stats) {
       content: [{ type: 'text/html', value: body }],
     }),
   });
-
-  if (!resp.ok) {
-    throw new Error(`SendGrid error: ${resp.status}`);
-  }
 }
 
 // --- Export with Sentry wrapping ---
@@ -525,6 +576,9 @@ export default Sentry.withSentry(
     },
 
     async scheduled(event, env, ctx) {
+      // Clean up stuck runs first
+      await db.cleanupStuckRuns(env.DB);
+
       const accounts = await getAccounts(env.CONFIG);
       if (accounts.length === 0) {
         console.log('No accounts configured, skipping scheduled run');
